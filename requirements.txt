@@ -1,2 +1,2 @@
-gymnasium>=1.0.0
+gymnasium[classic-control]>=1.0.0
 numpy>=1.26.0

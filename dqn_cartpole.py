@@ -313,6 +313,31 @@ def train():
     print("  唯一的差別是把 Q-table 換成了神經網路。")
     print("  這就是 Deep RL 的本質。")
 
+    return agent
+
+
+def demo(agent):
+    """開視窗展示訓練完的 policy"""
+    print("\n開啟視覺化視窗，按 Ctrl+C 結束...")
+    env = gym.make("CartPole-v1", render_mode="human")
+    try:
+        while True:
+            state, _ = env.reset()
+            steps = 0
+            while True:
+                q_values = agent.main_net.predict(state)
+                action   = int(np.argmax(q_values))
+                state, _, terminated, truncated, _ = env.step(action)
+                steps += 1
+                if terminated or truncated:
+                    print(f"  {steps} 步")
+                    break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        env.close()
+
 
 if __name__ == "__main__":
-    train()
+    agent = train()
+    demo(agent)

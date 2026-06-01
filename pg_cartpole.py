@@ -349,6 +349,31 @@ def train():
     print("  PG   → 直接學機率 → 取樣 → 動作（直接）")
     print("  下一步：Actor-Critic 把兩者結合，用 Critic 降低 PG 的高方差。")
 
+    return agent
+
+
+def demo(agent):
+    """開視窗展示最佳 policy 的實際表現"""
+    print("\n開啟視覺化視窗，按 Ctrl+C 結束...")
+    env = gym.make("CartPole-v1", render_mode="human")
+    try:
+        while True:
+            state, _ = env.reset()
+            steps = 0
+            while True:
+                probs  = agent.best_net.predict_probs(state)
+                action = int(np.argmax(probs))
+                state, _, terminated, truncated, _ = env.step(action)
+                steps += 1
+                if terminated or truncated:
+                    print(f"  {steps} 步")
+                    break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        env.close()
+
 
 if __name__ == "__main__":
-    train()
+    agent = train()
+    demo(agent)
