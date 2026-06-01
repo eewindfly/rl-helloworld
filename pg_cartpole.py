@@ -1,0 +1,327 @@
+"""
+RL Hello World 3 — Policy Gradient (REINFORCE) on CartPole
+============================================================
+從 DQN（學 Q 值）進化到 Policy Gradient（直接學動作機率）
+
+【DQN 的做法回顧】
+
+  DQN 學的是 Q(s, a)：每個動作的「預期總獎勵」
+  選動作：argmax Q(s, a)  ← 間接，先估值再推動作
+
+【Policy Gradient 的做法】
+
+  直接學 policy π(a|s)：在狀態 s 下，每個動作的「機率」
+  選動作：依照機率分佈取樣  ← 直接輸出機率
+
+  網路輸出 softmax → 機率分佈
+    [0.3, 0.7] → 30% 向左，70% 向右
+
+【REINFORCE 演算法】
+
+  核心思路：
+    做出好結果的動作 → 提高它的機率
+    做出差結果的動作 → 降低它的機率
+
+  怎麼定義「好不好」？
+    G_t = r_t + γ·r_{t+1} + γ²·r_{t+2} + ...
+    = 從第 t 步開始到結尾的累積折扣獎勵（Monte Carlo return）
+
+  更新公式：
+    ∇J = Σ_t  log π(a_t | s_t) × G_t
+
+    直覺解釋：
+      G_t 大（這一段走得好）→ 增大 log π（提高這些動作的機率）
+      G_t 小（走得差）       → 減小 log π（降低這些動作的機率）
+
+【REINFORCE vs DQN 的關鍵差異】
+
+  | 項目           | DQN                    | REINFORCE              |
+  |----------------|------------------------|------------------------|
+  | 學的是         | Q(s,a) 數值            | π(a|s) 機率            |
+  | 選動作         | argmax（確定性）        | 取樣（隨機性）          |
+  | 訓練時機       | 每一步（off-policy）   | 整個 episode 結束後     |
+  | 資料使用       | replay buffer 重複用   | 跑完就丟（on-policy）   |
+  | 方差           | 低                     | 高（Monte Carlo）       |
+
+【為什麼要學 Policy Gradient？】
+
+  Actor-Critic 和 PPO 全部建立在這個基礎上。
+  RLHF（ChatGPT 的訓練方式）用的是 PPO，而 PPO 是 Policy Gradient 的延伸。
+"""
+
+import numpy as np
+import random
+import gymnasium as gym
+
+
+# ─────────────────────────────────────────────────────────
+#  1. Policy Network（純 numpy）
+# ─────────────────────────────────────────────────────────
+
+class PolicyNetwork:
+    """
+    Policy 網路：輸入狀態，輸出動作機率
+    架構：輸入(4) → 隱藏層(64, ReLU) → 輸出(2, Softmax)
+
+    和 DQN 的網路差異：
+      DQN：輸出 Q 值（任意實數）
+      PG ：輸出機率（0~1，加總為 1）→ 用 softmax 保證
+    """
+    def __init__(self, input_dim=4, hidden_dim=64, output_dim=2):
+        self.W1 = np.random.randn(input_dim, hidden_dim) * np.sqrt(2.0 / input_dim)
+        self.b1 = np.zeros(hidden_dim)
+        self.W2 = np.random.randn(hidden_dim, output_dim) * np.sqrt(2.0 / hidden_dim)
+        self.b2 = np.zeros(output_dim)
+
+    def softmax(self, x):
+        """數值穩定的 softmax：先減最大值防止 overflow"""
+        x = x - np.max(x, axis=-1, keepdims=True)
+        exp_x = np.exp(x)
+        return exp_x / exp_x.sum(axis=-1, keepdims=True)
+
+    def forward(self, x):
+        """前向傳播，回傳動作機率"""
+        self.x  = x
+        self.h  = np.maximum(0, x @ self.W1 + self.b1)   # ReLU
+        logits  = self.h @ self.W2 + self.b2
+        self.probs = self.softmax(logits)
+        return self.probs
+
+    def backward(self, grad_logits, lr):
+        """
+        反向傳播
+        grad_logits：loss 對 softmax 輸入（logits）的梯度
+        """
+        # 輸出層
+        dW2 = self.h.T @ grad_logits
+        db2 = grad_logits.sum(axis=0)
+
+        # 隱藏層（ReLU 反向）
+        grad_h = grad_logits @ self.W2.T
+        grad_h[self.h <= 0] = 0
+
+        dW1 = self.x.T @ grad_h
+        db1 = grad_h.sum(axis=0)
+
+        # Gradient ascent（我們在最大化目標，所以加而不是減）
+        # 這裡統一用 -= 並讓外部傳入負梯度（等效）
+        self.W1 -= lr * dW1
+        self.b1 -= lr * db1
+        self.W2 -= lr * dW2
+        self.b2 -= lr * db2
+
+    def predict_probs(self, state):
+        """單筆推論：輸入狀態，輸出動作機率"""
+        x = state.reshape(1, -1)
+        return self.forward(x)[0]
+
+
+# ─────────────────────────────────────────────────────────
+#  2. Policy Gradient Agent (REINFORCE)
+# ─────────────────────────────────────────────────────────
+
+class PGAgent:
+    def __init__(self):
+        self.policy_net = PolicyNetwork()
+
+        # 超參數
+        self.gamma = 0.99   # 折扣因子
+        self.lr    = 0.003  # 學習率（PG 比 DQN 需要稍大的 lr）
+
+        # 一個 episode 的軌跡
+        self.states  = []
+        self.actions = []
+        self.rewards = []
+
+    def choose_action(self, state):
+        """
+        根據 policy 輸出的機率分佈取樣動作
+
+        為什麼用取樣而不是 argmax？
+          取樣保留了「探索性」：機率低的動作偶爾也會被選到
+          argmax 是確定性的，會困在局部最優
+
+        注意：測試時可以改用 argmax（exploitation only）
+        """
+        probs = self.policy_net.predict_probs(state)
+        action = np.random.choice(len(probs), p=probs)
+        return action
+
+    def store(self, state, action, reward):
+        """記錄這一步的資料（等 episode 結束再一起更新）"""
+        self.states.append(state)
+        self.actions.append(action)
+        self.rewards.append(reward)
+
+    def compute_returns(self):
+        """
+        計算每一步的 Monte Carlo Return G_t
+
+        G_t = r_t + γ·r_{t+1} + γ²·r_{t+2} + ... + γ^{T-t}·r_T
+
+        從後往前算效率最高：
+          G_T = r_T
+          G_{T-1} = r_{T-1} + γ·G_T
+          ...
+
+        為什麼要 normalize（減均值除標準差）？
+          ─ 降低方差：Monte Carlo return 的方差很大，
+            同一個動作在不同 episode 可能得到差異極大的 G_t
+          ─ normalize 後 G_t 變成「比這個 episode 的平均好多少」
+            → 好的動作 G_t > 0，差的 G_t < 0，梯度方向更明確
+        """
+        T = len(self.rewards)
+        returns = np.zeros(T)
+        G = 0.0
+        for t in reversed(range(T)):
+            G = self.rewards[t] + self.gamma * G
+            returns[t] = G
+
+        # Normalize（降低方差，讓訓練更穩定）
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+        return returns
+
+    def update(self):
+        """
+        用整個 episode 的軌跡更新 policy
+
+        REINFORCE 梯度公式：
+          ∇J = Σ_t  ∇ log π(a_t | s_t) × G_t
+
+        ∇ log π(a_t | s_t) 對 softmax logits 的梯度：
+          令 p = softmax(logits)
+          ∂ log p[a] / ∂ logits = (1_{i=a} - p[i])
+          也就是：one-hot(a) - p
+
+        Loss（我們最大化 J，等效於最小化 -J）：
+          對 logits 的梯度 = -(one_hot(a) - p) × G_t
+        """
+        returns = self.compute_returns()
+        T = len(self.states)
+
+        states  = np.array(self.states)    # (T, 4)
+        actions = np.array(self.actions)   # (T,)
+
+        # 前向傳播，取得所有時間步的動作機率
+        probs = self.policy_net.forward(states)   # (T, 2)
+
+        # 計算梯度：∂(-J) / ∂logits_t = -(one_hot(a_t) - probs_t) × G_t
+        one_hot = np.zeros_like(probs)
+        one_hot[np.arange(T), actions] = 1.0
+
+        grad_logits = -(one_hot - probs) * returns.reshape(-1, 1)
+        grad_logits /= T    # 對 T 做平均，讓梯度大小不受 episode 長度影響
+
+        # 反向傳播更新 policy
+        self.policy_net.backward(grad_logits, self.lr)
+
+        # 清空軌跡（on-policy：跑完就丟）
+        self.states  = []
+        self.actions = []
+        self.rewards = []
+
+        # 回傳這個 episode 的總獎勵（用來印進度）
+        return sum(self.rewards) if self.rewards else 0
+
+
+# ─────────────────────────────────────────────────────────
+#  3. 訓練迴圈
+# ─────────────────────────────────────────────────────────
+
+def train():
+    env   = gym.make("CartPole-v1")
+    agent = PGAgent()
+
+    EPISODES = 500
+    scores   = []
+
+    print("=" * 60)
+    print("  RL Hello World 3 — Policy Gradient (REINFORCE)")
+    print("=" * 60)
+    print("\n核心概念：直接學動作機率，不再學 Q 值")
+    print("更新時機：整個 episode 跑完後才更新（Monte Carlo）")
+    print("目標    ：近 50 回合平均分 ≥ 195 = 解決！")
+    print(f"\n開始訓練 {EPISODES} 個 episodes...\n")
+
+    for episode in range(EPISODES):
+        state, _ = env.reset()
+        total_reward = 0
+
+        while True:
+            action = agent.choose_action(state)
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+
+            # 記錄軌跡（不像 DQN 存進 buffer，而是存到 episode 結束）
+            agent.store(state, action, reward)
+            total_reward += reward
+            state = next_state
+
+            if done:
+                break
+
+        # Episode 結束，用整條軌跡更新 policy
+        agent.update()
+        scores.append(total_reward)
+
+        # 每 50 回合印進度
+        if (episode + 1) % 50 == 0:
+            avg_score = np.mean(scores[-50:])
+            solved    = "✓ 解決！" if avg_score >= 195 else ""
+            print(f"Episode {episode+1:4d} | "
+                  f"近50回合平均分: {avg_score:6.1f}  {solved}")
+
+    env.close()
+
+    # ─────────────────────────────────────────────────────
+    #  4. 展示訓練完的 agent
+    # ─────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("  訓練完成！跑 5 次展示（使用 argmax，純 exploitation）")
+    print("=" * 60)
+
+    env = gym.make("CartPole-v1")
+    for trial in range(5):
+        state, _ = env.reset()
+        steps = 0
+        while True:
+            # 展示時用 argmax（確定性），不再隨機取樣
+            probs  = agent.policy_net.predict_probs(state)
+            action = int(np.argmax(probs))
+            state, _, terminated, truncated, _ = env.step(action)
+            steps += 1
+            if terminated or truncated:
+                break
+        result = "✓ 撐住了！" if steps >= 195 else f"倒了（{steps} 步）"
+        print(f"  Trial {trial+1}：{steps} 步  {result}")
+
+    env.close()
+
+    # ─────────────────────────────────────────────────────
+    #  5. 對比總結：DQN vs Policy Gradient
+    # ─────────────────────────────────────────────────────
+    print("\n" + "=" * 60)
+    print("  DQN vs Policy Gradient 對比")
+    print("=" * 60)
+    rows = [
+        ("學的目標",   "Q(s,a) 數值",          "π(a|s) 機率"),
+        ("輸出層",     "線性（任意實數）",       "Softmax（機率）"),
+        ("選動作",     "argmax Q（確定性）",     "取樣（隨機性）"),
+        ("訓練時機",   "每一步",                "Episode 結束後"),
+        ("資料重用",   "Replay buffer（可重用）","On-policy（跑完就丟）"),
+        ("Return",     "Bellman（一步 TD）",     "Monte Carlo（整段）"),
+        ("方差",       "低",                    "高（需 normalize）"),
+    ]
+    print(f"  {'':14s} {'DQN':24s} {'Policy Gradient':24s}")
+    print("  " + "-" * 64)
+    for label, dqn, pg in rows:
+        print(f"  {label:14s} {dqn:24s} {pg:24s}")
+
+    print("\n核心洞見：")
+    print("  DQN  → 學 Q 值 → argmax → 動作（間接）")
+    print("  PG   → 直接學機率 → 取樣 → 動作（直接）")
+    print("  下一步：Actor-Critic 把兩者結合，用 Critic 降低 PG 的高方差。")
+
+
+if __name__ == "__main__":
+    train()
