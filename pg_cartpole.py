@@ -178,9 +178,14 @@ class PGAgent:
 
     def compute_returns(self, rewards):
         """
-        計算單條軌跡每一步的 Monte Carlo Return G_t
+        計算單條軌跡每一步的 Monte Carlo return（reward-to-go）G_t
 
         G_t = r_t + γ·r_{t+1} + γ²·r_{t+2} + ... + γ^{T-t}·r_T
+
+        「reward-to-go」= 從第 t 步開始還能拿到多少獎勵。
+        用 G_t 而非整條軌跡的總回報 R(τ)，是因為 t 步之前的獎勵
+        跟第 t 步選什麼動作無關，納入只會增加梯度估計的方差，
+        拿掉後期望值不變但方差更小。
         """
         T = len(rewards)
         returns = np.zeros(T)
