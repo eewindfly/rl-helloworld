@@ -27,7 +27,7 @@ RL Hello World 3 — Policy Gradient (REINFORCE) on CartPole
     = 從第 t 步開始到結尾的累積折扣獎勵（Monte Carlo return）
 
   更新公式：
-    ∇J = Σ_t  log π(a_t | s_t) × G_t
+    ∇J = Σ_t  ∇log π(a_t | s_t) × G_t
 
     直覺解釋：
       G_t 大（這一段走得好）→ 增大 log π（提高這些動作的機率）
@@ -50,7 +50,6 @@ RL Hello World 3 — Policy Gradient (REINFORCE) on CartPole
 """
 
 import numpy as np
-import random
 import gymnasium as gym
 
 
