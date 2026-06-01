@@ -51,6 +51,7 @@ RL Hello World 3 — Policy Gradient (REINFORCE) on CartPole
 
 import numpy as np
 import gymnasium as gym
+from utils import demo
 
 
 # ─────────────────────────────────────────────────────────
@@ -352,28 +353,6 @@ def train():
     return agent
 
 
-def demo(agent):
-    """開視窗展示最佳 policy 的實際表現"""
-    print("\n開啟視覺化視窗，按 Ctrl+C 結束...")
-    env = gym.make("CartPole-v1", render_mode="human")
-    try:
-        while True:
-            state, _ = env.reset()
-            steps = 0
-            while True:
-                probs  = agent.best_net.predict_probs(state)
-                action = int(np.argmax(probs))
-                state, _, terminated, truncated, _ = env.step(action)
-                steps += 1
-                if terminated or truncated:
-                    print(f"  {steps} 步")
-                    break
-    except KeyboardInterrupt:
-        pass
-    finally:
-        env.close()
-
-
 if __name__ == "__main__":
     agent = train()
-    demo(agent)
+    demo(lambda state: int(np.argmax(agent.best_net.predict_probs(state))))

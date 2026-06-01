@@ -50,6 +50,7 @@ import numpy as np
 import random
 from collections import deque
 import gymnasium as gym
+from utils import demo
 
 # ─────────────────────────────────────────────────────────
 #  1. 簡單神經網路（純 numpy 實作，看清楚內部）
@@ -316,28 +317,6 @@ def train():
     return agent
 
 
-def demo(agent):
-    """開視窗展示訓練完的 policy"""
-    print("\n開啟視覺化視窗，按 Ctrl+C 結束...")
-    env = gym.make("CartPole-v1", render_mode="human")
-    try:
-        while True:
-            state, _ = env.reset()
-            steps = 0
-            while True:
-                q_values = agent.main_net.predict(state)
-                action   = int(np.argmax(q_values))
-                state, _, terminated, truncated, _ = env.step(action)
-                steps += 1
-                if terminated or truncated:
-                    print(f"  {steps} 步")
-                    break
-    except KeyboardInterrupt:
-        pass
-    finally:
-        env.close()
-
-
 if __name__ == "__main__":
     agent = train()
-    demo(agent)
+    demo(lambda state: int(np.argmax(agent.main_net.predict(state))))
