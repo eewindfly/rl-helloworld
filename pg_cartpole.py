@@ -233,6 +233,12 @@ class PGAgent:
         returns = np.array(all_returns)
 
         # N 條軌跡合併後統一 normalize，保留跨 episode 的相對差異
+        # 注意：用全局 mean 當 baseline 有已知的系統性問題——
+        #   G_t 天然隨時間遞減（後面步數少，累積獎勵小），
+        #   導致後期動作相對 mean 偏低，被系統性懲罰，
+        #   即使整條軌跡走得好也一樣。
+        # 正確做法是用 V(s) 當 baseline（Advantage = G_t - V(s)），
+        # 針對每個狀態估出合理期望，這就是 Actor-Critic 要解決的問題。
         returns = (returns - returns.mean()) / (returns.std() + 1e-8)
         T = len(states)
 
