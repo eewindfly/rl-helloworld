@@ -126,12 +126,13 @@ class PGAgent:
 
         # 超參數
         self.gamma = 0.99   # 折扣因子
-        self.lr    = 0.003  # 學習率（PG 比 DQN 需要稍大的 lr）
+        self.lr    = 0.01   # 學習率
 
-        # 一個 episode 的軌跡
-        self.states  = []
-        self.actions = []
-        self.rewards = []
+        # 存放多條軌跡（每條是一個 episode）
+        self.trajectories = []      # list of (states, actions, rewards)
+        self._cur_states  = []      # 當前 episode 暫存
+        self._cur_actions = []
+        self._cur_rewards = []
 
     def choose_action(self, state):
         """
@@ -148,42 +149,44 @@ class PGAgent:
         return action
 
     def store(self, state, action, reward):
-        """記錄這一步的資料（等 episode 結束再一起更新）"""
-        self.states.append(state)
-        self.actions.append(action)
-        self.rewards.append(reward)
+        """記錄這一步的資料"""
+        self._cur_states.append(state)
+        self._cur_actions.append(action)
+        self._cur_rewards.append(reward)
 
-    def compute_returns(self):
+    def end_episode(self):
+        """Episode 結束，把這條軌跡存起來"""
+        self.trajectories.append((
+            list(self._cur_states),
+            list(self._cur_actions),
+            list(self._cur_rewards),
+        ))
+        self._cur_states  = []
+        self._cur_actions = []
+        self._cur_rewards = []
+
+    def compute_returns(self, rewards):
         """
-        計算每一步的 Monte Carlo Return G_t
+        計算單條軌跡每一步的 Monte Carlo Return G_t
 
         G_t = r_t + γ·r_{t+1} + γ²·r_{t+2} + ... + γ^{T-t}·r_T
-
-        從後往前算效率最高：
-          G_T = r_T
-          G_{T-1} = r_{T-1} + γ·G_T
-          ...
-
-        為什麼要 normalize（減均值除標準差）？
-          ─ 降低方差：Monte Carlo return 的方差很大，
-            同一個動作在不同 episode 可能得到差異極大的 G_t
-          ─ normalize 後 G_t 變成「比這個 episode 的平均好多少」
-            → 好的動作 G_t > 0，差的 G_t < 0，梯度方向更明確
         """
-        T = len(self.rewards)
+        T = len(rewards)
         returns = np.zeros(T)
         G = 0.0
         for t in reversed(range(T)):
-            G = self.rewards[t] + self.gamma * G
+            G = rewards[t] + self.gamma * G
             returns[t] = G
-
-        # Normalize（降低方差，讓訓練更穩定）
-        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
         return returns
 
     def update(self):
         """
-        用整個 episode 的軌跡更新 policy
+        用收集到的 N 條軌跡更新 policy
+
+        對應公式：∇R̄_θ ≈ (1/N) Σ_n Σ_t R(τ^n) ∇log π(a_t^n | s_t^n)
+
+        每條軌跡先各自算 return，N 條全部收集完後統一 normalize。
+        除以 N 對應公式裡的 1/N（估計期望值）。
 
         REINFORCE 梯度公式：
           ∇J = Σ_t  ∇ log π(a_t | s_t) × G_t
@@ -196,13 +199,28 @@ class PGAgent:
         Loss（我們最大化 J，等效於最小化 -J）：
           對 logits 的梯度 = -(one_hot(a) - p) × G_t
         """
-        returns = self.compute_returns()
-        T = len(self.states)
+        N = len(self.trajectories)
 
-        states  = np.array(self.states)    # (T, 4)
-        actions = np.array(self.actions)   # (T,)
+        # 每條軌跡各自算 return，再合併
+        all_states   = []
+        all_actions  = []
+        all_returns  = []
 
-        # 前向傳播，取得所有時間步的動作機率
+        for states, actions, rewards in self.trajectories:
+            returns = self.compute_returns(rewards)
+            all_states.extend(states)
+            all_actions.extend(actions)
+            all_returns.extend(returns)
+
+        states  = np.array(all_states)
+        actions = np.array(all_actions)
+        returns = np.array(all_returns)
+
+        # N 條軌跡合併後統一 normalize，保留跨 episode 的相對差異
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+        T = len(states)
+
+        # 前向傳播
         probs = self.policy_net.forward(states)   # (T, 2)
 
         # 計算梯度：∂(-J) / ∂logits_t = -(one_hot(a_t) - probs_t) × G_t
@@ -210,18 +228,13 @@ class PGAgent:
         one_hot[np.arange(T), actions] = 1.0
 
         grad_logits = -(one_hot - probs) * returns.reshape(-1, 1)
-        grad_logits /= T    # 對 T 做平均，讓梯度大小不受 episode 長度影響
+        grad_logits /= N    # 對應公式的 1/N
 
         # 反向傳播更新 policy
         self.policy_net.backward(grad_logits, self.lr)
 
-        # 清空軌跡（on-policy：跑完就丟）
-        self.states  = []
-        self.actions = []
-        self.rewards = []
-
-        # 回傳這個 episode 的總獎勵（用來印進度）
-        return sum(self.rewards) if self.rewards else 0
+        # 清空（on-policy：用完就丟）
+        self.trajectories = []
 
 
 # ─────────────────────────────────────────────────────────
@@ -232,14 +245,15 @@ def train():
     env   = gym.make("CartPole-v1")
     agent = PGAgent()
 
-    EPISODES = 500
-    scores   = []
+    EPISODES  = 1000
+    N_UPDATES = 4     # 每收集幾條軌跡才更新一次（N in the formula）
+    scores    = []
 
     print("=" * 60)
     print("  RL Hello World 3 — Policy Gradient (REINFORCE)")
     print("=" * 60)
     print("\n核心概念：直接學動作機率，不再學 Q 值")
-    print("更新時機：整個 episode 跑完後才更新（Monte Carlo）")
+    print(f"更新時機：每收集 {N_UPDATES} 條軌跡後更新（Monte Carlo，N={N_UPDATES}）")
     print("目標    ：近 50 回合平均分 ≥ 195 = 解決！")
     print(f"\n開始訓練 {EPISODES} 個 episodes...\n")
 
@@ -252,7 +266,6 @@ def train():
             next_state, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
 
-            # 記錄軌跡（不像 DQN 存進 buffer，而是存到 episode 結束）
             agent.store(state, action, reward)
             total_reward += reward
             state = next_state
@@ -260,9 +273,12 @@ def train():
             if done:
                 break
 
-        # Episode 結束，用整條軌跡更新 policy
-        agent.update()
+        agent.end_episode()
         scores.append(total_reward)
+
+        # 每收集 N_UPDATES 條軌跡才更新一次
+        if (episode + 1) % N_UPDATES == 0:
+            agent.update()
 
         # 每 50 回合印進度
         if (episode + 1) % 50 == 0:
