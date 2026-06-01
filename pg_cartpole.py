@@ -246,6 +246,12 @@ class PGAgent:
         probs = self.policy_net.forward(states)   # (T, 2)
 
         # 計算梯度：∂(-J) / ∂logits_t = -(one_hot(a_t) - probs_t) × G_t
+        #
+        # 跟 classification cross-entropy 的梯度非常像：
+        #   Classification：one_hot(y) - p          （每筆權重相同）
+        #   REINFORCE    ：(one_hot(a) - p) × G_t   （用 G_t 當權重）
+        # REINFORCE 可理解成「加權版 cross-entropy」，
+        # G_t 決定每個動作的學習力道：走得好的梯度大，走得差的梯度小或反向。
         one_hot = np.zeros_like(probs)
         one_hot[np.arange(T), actions] = 1.0
 
