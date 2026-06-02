@@ -41,6 +41,25 @@ RL Hello World 4 — Actor-Critic (A2C) on CartPole
   2. 更新 Actor 時，把 G_t 換成 Advantage = G_t - V(s)
 
   其餘結構（訓練迴圈、反向傳播邏輯）和 pg_cartpole.py 完全相同。
+
+【MC vs TD：兩種估計 Q 的方式】
+
+  Advantage = Q(s,a) - V(s)，Q 不直接 train，用估計替代：
+
+  本實作用 MC 版本。
+
+                    MC                        TD
+  ──────────────────────────────────────────────────────────
+  Q 估計            G_t                       r_t + γV(s_{t+1})
+  V 的訓練 target   G_t                       r_t + γV(s_{t+1})
+  Advantage         G_t - V(s_t)              r_t + γV(s_{t+1}) - V(s_t)
+  方差              高                        低
+  Bias              無                        有（V 不準就偏）
+  適用任務          有終點的任務              有終點或無終點皆可
+  Actor 更新時機    N 個 episode 結束後       N 個 episode 結束後
+  Critic 更新時機   episode 結束後            理論上每步可更新，實務通常同 Actor
+
+  兩套各自一致：Q 的估計方式決定了 V 的訓練 target，是同一個選擇。
 """
 
 import numpy as np
