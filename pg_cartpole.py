@@ -123,8 +123,6 @@ class PolicyNetwork:
 class PGAgent:
     def __init__(self):
         self.policy_net  = PolicyNetwork()
-        self.best_net    = PolicyNetwork()   # 保存訓練中最佳的 policy
-        self.best_score  = -float('inf')
 
         # 超參數
         self.gamma = 0.99   # 折扣因子
@@ -135,15 +133,6 @@ class PGAgent:
         self._cur_states  = []      # 當前 episode 暫存
         self._cur_actions = []
         self._cur_rewards = []
-
-    def update_best(self, avg_score):
-        """如果近期平均分創新高，保存當前 policy"""
-        if avg_score > self.best_score:
-            self.best_score = avg_score
-            self.best_net.W1 = self.policy_net.W1.copy()
-            self.best_net.b1 = self.policy_net.b1.copy()
-            self.best_net.W2 = self.policy_net.W2.copy()
-            self.best_net.b2 = self.policy_net.b2.copy()
 
     def choose_action(self, state):
         """
@@ -311,7 +300,6 @@ def train():
         # 每 50 回合印進度，並更新最佳 policy
         if (episode + 1) % 50 == 0:
             avg_score = np.mean(scores[-50:])
-            agent.update_best(avg_score)
             solved    = "✓ 解決！" if avg_score >= 195 else ""
             print(f"Episode {episode+1:4d} | "
                   f"近50回合平均分: {avg_score:6.1f}  {solved}")
@@ -322,7 +310,7 @@ def train():
     #  4. 展示訓練完的 agent
     # ─────────────────────────────────────────────────────
     print("\n" + "=" * 60)
-    print(f"  訓練完成！用最佳 policy（平均分 {agent.best_score:.1f}）跑 5 次展示")
+    print("  訓練完成！跑 5 次展示")
     print("=" * 60)
 
     env = gym.make("CartPole-v1")
@@ -330,8 +318,7 @@ def train():
         state, _ = env.reset()
         steps = 0
         while True:
-            # 展示時用最佳 policy + argmax（確定性）
-            probs  = agent.best_net.predict_probs(state)
+            probs  = agent.policy_net.predict_probs(state)
             action = int(np.argmax(probs))
             state, _, terminated, truncated, _ = env.step(action)
             steps += 1
@@ -372,4 +359,4 @@ def train():
 
 if __name__ == "__main__":
     agent = train()
-    demo(lambda state: int(np.argmax(agent.best_net.predict_probs(state))))
+    demo(lambda state: int(np.argmax(agent.policy_net.predict_probs(state))))

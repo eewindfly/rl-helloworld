@@ -107,10 +107,6 @@ class ACAgent:
         self.actor  = ActorNetwork()
         self.critic = CriticNetwork()
 
-        # 保存訓練中最佳的 Actor
-        self.best_actor = ActorNetwork()
-        self.best_score = -float('inf')
-
         # 超參數
         self.gamma     = 0.99
         self.actor_lr  = 0.005
@@ -120,14 +116,6 @@ class ACAgent:
         self._states  = []
         self._actions = []
         self._rewards = []
-
-    def update_best(self, avg_score):
-        if avg_score > self.best_score:
-            self.best_score = avg_score
-            self.best_actor.W1 = self.actor.W1.copy()
-            self.best_actor.b1 = self.actor.b1.copy()
-            self.best_actor.W2 = self.actor.W2.copy()
-            self.best_actor.b2 = self.actor.b2.copy()
 
     def choose_action(self, state):
         probs = self.actor.predict_probs(state)
@@ -239,7 +227,6 @@ def train():
 
         if (episode + 1) % 50 == 0:
             avg_score = np.mean(scores[-50:])
-            agent.update_best(avg_score)
             solved = "✓ 解決！" if avg_score >= 195 else ""
             print(f"Episode {episode+1:4d} | "
                   f"近50回合平均分: {avg_score:6.1f}  {solved}")
@@ -250,7 +237,7 @@ def train():
     #  5. 展示訓練完的 Agent
     # ─────────────────────────────────────────────────────
     print("\n" + "=" * 60)
-    print(f"  訓練完成！用最佳 Actor（平均分 {agent.best_score:.1f}）跑 5 次展示")
+    print("  訓練完成！跑 5 次展示")
     print("=" * 60)
 
     env = gym.make("CartPole-v1")
@@ -258,7 +245,7 @@ def train():
         state, _ = env.reset()
         steps = 0
         while True:
-            probs  = agent.best_actor.predict_probs(state)
+            probs  = agent.actor.predict_probs(state)
             action = int(np.argmax(probs))
             state, _, terminated, truncated, _ = env.step(action)
             steps += 1
@@ -298,4 +285,4 @@ def train():
 
 if __name__ == "__main__":
     agent = train()
-    demo(lambda state: int(np.argmax(agent.best_actor.predict_probs(state))))
+    demo(lambda state: int(np.argmax(agent.actor.predict_probs(state))))
