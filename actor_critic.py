@@ -131,19 +131,31 @@ class ACAgent:
         self.actor_lr  = 0.005
         self.critic_lr = 0.01   # Critic 通常用較高學習率，讓 V(s) 快點準確
 
-        # 當前 episode 暫存
-        self._states  = []
-        self._actions = []
-        self._rewards = []
+        # 存放多條軌跡（和 PG 相同）
+        self.trajectories = []      # list of (states, actions, rewards)
+        self._cur_states  = []      # 當前 episode 暫存
+        self._cur_actions = []
+        self._cur_rewards = []
 
     def choose_action(self, state):
         probs = self.actor.predict_probs(state)
         return np.random.choice(len(probs), p=probs)
 
     def store(self, state, action, reward):
-        self._states.append(state)
-        self._actions.append(action)
-        self._rewards.append(reward)
+        self._cur_states.append(state)
+        self._cur_actions.append(action)
+        self._cur_rewards.append(reward)
+
+    def end_episode(self):
+        """Episode 結束，把這條軌跡存起來（和 PG 相同）"""
+        self.trajectories.append((
+            list(self._cur_states),
+            list(self._cur_actions),
+            list(self._cur_rewards),
+        ))
+        self._cur_states  = []
+        self._cur_actions = []
+        self._cur_rewards = []
 
     def compute_returns(self, rewards):
         """Monte Carlo return：從每一步開始的累積折扣獎勵 G_t"""
@@ -157,53 +169,58 @@ class ACAgent:
 
     def update(self):
         """
-        Episode 結束後同時更新 Actor 和 Critic
+        用收集到的 N 條軌跡同時更新 Actor 和 Critic（和 PG 相同結構）
 
         流程：
-          1. 算 G_t（Monte Carlo return）
+          1. 每條軌跡各自算 G_t，合併成一個大 batch
           2. Critic 前向：估 V(s) for 所有狀態
           3. Advantage = G_t - V(s)
           4. 更新 Critic：MSE loss，讓 V(s) → G_t
-          5. 更新 Actor ：用 Advantage 替換 REINFORCE 的 G_t
+          5. 更新 Actor ：用 Advantage 替換 REINFORCE 的 G_t，除以 N
         """
-        states  = np.array(self._states)    # (T, 4)
-        actions = np.array(self._actions)   # (T,)
-        T = len(self._rewards)
+        N = len(self.trajectories)
 
-        # 步驟 1：Monte Carlo return
-        returns = self.compute_returns(self._rewards)   # (T,)
+        # 步驟 1：每條軌跡各自算 return，再合併（和 PG 相同）
+        all_states   = []
+        all_actions  = []
+        all_returns  = []
+
+        for states, actions, rewards in self.trajectories:
+            returns = self.compute_returns(rewards)
+            all_states.extend(states)
+            all_actions.extend(actions)
+            all_returns.extend(returns)
+
+        states  = np.array(all_states)
+        actions = np.array(all_actions)
+        returns = np.array(all_returns)
+        T = len(states)
 
         # 步驟 2：Critic 估 V(s)
         values = self.critic.forward(states)   # (T,)
 
         # 步驟 3：Advantage
-        #
-        #   REINFORCE：用 normalize(G_t) → 和「全局平均」比
-        #   Actor-Critic：用 G_t - V(s)  → 和「這個狀態的期望值」比（更精確）
-        #
-        #   不再需要 normalize：Advantage 本身已是相對值，
-        #   V(s) 吸收了大部分基線方差，梯度估計穩定很多。
+        #   REINFORCE：normalize(G_t) → 用全局 mean 當 baseline
+        #   Actor-Critic：G_t - V(s)  → 用每個狀態的期望值當 baseline（更精確）
         advantage = returns - values   # (T,)
 
         # 步驟 4：更新 Critic
-        #   Loss = mean( (V(s) - G_t)^2 )
-        #   dL/dV = (V(s) - G_t) / T
+        #   Loss = mean( (V(s) - G_t)^2 )，dL/dV = (V(s) - G_t) / T
         grad_v = (values - returns) / T
         self.critic.backward(grad_v, self.critic_lr)
 
         # 步驟 5：更新 Actor
         #   ∇J = Σ_t ∇ log π(a_t | s_t) × A_t
-        #   和 REINFORCE 完全相同，只是把 G_t 換成 advantage
+        #   除以 N（對應公式的 1/N，和 PG 相同）
         probs = self.actor.forward(states)          # (T, 2)
         one_hot = np.zeros_like(probs)
         one_hot[np.arange(T), actions] = 1.0
-        grad_logits = -(one_hot - probs) * advantage.reshape(-1, 1) / T
+        grad_logits = -(one_hot - probs) * advantage.reshape(-1, 1)
+        grad_logits /= N    # 對應公式的 1/N，和 PG 相同
         self.actor.backward(grad_logits, self.actor_lr)
 
         # 清空（on-policy：跑完就丟）
-        self._states  = []
-        self._actions = []
-        self._rewards = []
+        self.trajectories = []
 
 
 # ─────────────────────────────────────────────────────────
@@ -214,14 +231,16 @@ def train():
     env   = gym.make("CartPole-v1")
     agent = ACAgent()
 
-    EPISODES = 1000
-    scores   = []
+    EPISODES  = 1000
+    N_UPDATES = 4     # 每收集幾條軌跡才更新一次（和 PG 相同）
+    scores    = []
 
     print("=" * 60)
     print("  RL Hello World 4 — Actor-Critic (A2C)")
     print("=" * 60)
     print("\n核心概念：Advantage = G_t - V(s)，Critic 降低梯度方差")
     print("兩個網路：Actor（學機率）+ Critic（學狀態價值）")
+    print(f"更新時機：每收集 {N_UPDATES} 條軌跡後更新（和 PG 相同）")
     print("目標    ：近 50 回合平均分 ≥ 195 = 解決！")
     print(f"\n開始訓練 {EPISODES} 個 episodes...\n")
 
@@ -241,8 +260,12 @@ def train():
             if done:
                 break
 
-        agent.update()
+        agent.end_episode()
         scores.append(total_reward)
+
+        # 每收集 N_UPDATES 條軌跡才更新一次（和 PG 相同）
+        if (episode + 1) % N_UPDATES == 0:
+            agent.update()
 
         if (episode + 1) % 50 == 0:
             avg_score = np.mean(scores[-50:])
