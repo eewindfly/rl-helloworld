@@ -46,49 +46,7 @@ RL Hello World 4 — Actor-Critic (A2C) on CartPole
 import numpy as np
 import gymnasium as gym
 from utils import demo
-
-
-# ─────────────────────────────────────────────────────────
-#  1. Actor 網路（和 pg_cartpole.py 的 PolicyNetwork 相同）
-# ─────────────────────────────────────────────────────────
-
-class ActorNetwork:
-    """
-    輸入狀態，輸出動作機率（softmax）
-    架構：4 → 64（ReLU）→ 2（Softmax）
-    """
-    def __init__(self, input_dim=4, hidden_dim=64, output_dim=2):
-        self.W1 = np.random.randn(input_dim, hidden_dim) * np.sqrt(2.0 / input_dim)
-        self.b1 = np.zeros(hidden_dim)
-        self.W2 = np.random.randn(hidden_dim, output_dim) * np.sqrt(2.0 / hidden_dim)
-        self.b2 = np.zeros(output_dim)
-
-    def softmax(self, x):
-        x = x - np.max(x, axis=-1, keepdims=True)
-        exp_x = np.exp(x)
-        return exp_x / exp_x.sum(axis=-1, keepdims=True)
-
-    def forward(self, x):
-        self.x = x
-        self.h = np.maximum(0, x @ self.W1 + self.b1)
-        logits = self.h @ self.W2 + self.b2
-        self.probs = self.softmax(logits)
-        return self.probs
-
-    def backward(self, grad_logits, lr):
-        dW2 = self.h.T @ grad_logits
-        db2 = grad_logits.sum(axis=0)
-        grad_h = grad_logits @ self.W2.T
-        grad_h[self.h <= 0] = 0
-        dW1 = self.x.T @ grad_h
-        db1 = grad_h.sum(axis=0)
-        self.W1 -= lr * dW1
-        self.b1 -= lr * db1
-        self.W2 -= lr * dW2
-        self.b2 -= lr * db2
-
-    def predict_probs(self, state):
-        return self.forward(state.reshape(1, -1))[0]
+from pg_cartpole import PolicyNetwork as ActorNetwork   # Actor 和 REINFORCE 的 policy 網路完全相同
 
 
 # ─────────────────────────────────────────────────────────
