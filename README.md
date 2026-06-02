@@ -12,7 +12,7 @@
 | 1 | `rl_helloworld.py` | Q-Learning | GridWorld (4×4) | ✅ 完成 |
 | 2 | `dqn_cartpole.py` | DQN | CartPole-v1 | ✅ 完成 |
 | 3 | `pg_cartpole.py` | Policy Gradient (REINFORCE) | CartPole-v1 | ✅ 完成 |
-| 4 | `actor_critic.py` | Actor-Critic (A2C) | CartPole-v1 | ⬜ 待做 |
+| 4 | `actor_critic.py` | Actor-Critic (A2C) | CartPole-v1 | ✅ 完成 |
 | 5 | `ppo_cartpole.py` | PPO | CartPole-v1 | ⬜ 待做 |
 | 6 | `ppo_custom_env.py` | PPO | 自訂環境 | ⬜ 待做 |
 
