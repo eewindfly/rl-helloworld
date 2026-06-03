@@ -58,12 +58,13 @@ class ACTDAgent:
         self.gamma     = 0.99
         # ⚠️ 和 MC 版唯一要動的東西：學習率必須重調，不能照抄 MC 版！
         #   公式（advantage、critic target）完全照教科書，沒有任何額外技巧。
-        #   原因見下方 update() 的「為何 MC 版的超參數搬過來會學不起來」。
+        #   詳細原因見下方 update() 的長註解；這裡先講結論：
         #   - actor_lr 調大（0.0005 → 0.02，約 40x）：
-        #       TD advantage = δ 量級只有 O(1)，MC advantage = G_t - V 是 O(數十)，
-        #       照抄 0.0005 等於 actor 幾乎不動。
+        #       TD 的 δ「單筆數值」比 MC 的 (G_t - V) 小很多（見下方說明），
+        #       SGD 每步更新 ≈ lr × advantage，advantage 小了就要把 lr 放大補回來，
+        #       否則 actor 幾乎不動。
         #   - critic_lr 調大（0.001 → 0.05）：
-        #       TD 是 bootstrap，critic 要夠準 advantage 才有意義，
+        #       TD 是 bootstrap，advantage 完全靠 critic 算，critic 要夠準才有意義，
         #       必須讓 V(s) 快點學起來。
         self.actor_lr  = 0.02
         self.critic_lr = 0.05
@@ -128,20 +129,50 @@ class ACTDAgent:
         #   和 MC 版完全相同，只是 advantage 換成 TD error δ。
         #   公式純教科書，沒有 normalize、沒有任何額外技巧。
         #
-        #   ⚠️ 為何 MC 版的超參數搬過來會「學不起來」？（已在上方調 lr 修正）
+        # ══════════════════════════════════════════════════════════════════
+        #  ⚠️ 為何「公式一樣」，照抄 MC 版的 lr 卻學不起來？
+        # ══════════════════════════════════════════════════════════════════
         #
-        #   CartPole 每一步（含倒下那步）reward 都是 +1。初期 critic 還沒學會，
-        #   V(s) ≈ 0，於是 advantage = r + γV(s') - V(s) ≈ +1 對「每一步」都成立，
-        #   連倒下那一步的 advantage 都是正的 → actor 被告知「每個動作都很好」，
-        #   完全學不到東西（原 lr 實測 avg 卡在 ~13）。
+        #  先講一個容易誤會的點：
         #
-        #   MC 版為何沒這問題？因為 MC advantage = G_t - V(s)，
-        #   主導項是真實 return G_t（O(數十)），就算 critic 很爛、符號也對得到。
-        #   TD advantage 完全由 critic 兩次輸出相減而來，critic 不準 → advantage 是雜訊；
-        #   且量級只有 O(1)（≈單一步的 δ），所以 actor_lr 必須調大、critic_lr 也要夠快。
+        #    MC advantage：A = G_t          - V(s)
+        #    TD advantage：δ = r + γV(s')   - V(s)
         #
-        #   代價：純 δ 不做 normalize，訓練會比 MC 版抖（偶爾回檔），
-        #         這正是 TD 高 bias / SGD 不穩的真實樣子——和 README 的對照一致。
+        #  兩者「期望值其實一樣」！因為
+        #       E[G_t | s,a] = E[r + γV(s') | s,a] = Q(s,a)
+        #    ⇒ 兩個 advantage 的期望都是同一個真實 advantage  A(s,a)=Q(s,a)-V(s)。
+        #  而 CartPole 的真實 advantage 本來就很小（換個動作對未來影響不大）。
+        #  所以「理論上不該差太多」這個直覺是對的——指的是期望。
+        #
+        #  真正差很多的是「單筆樣本的大小」，也就是 variance：
+        #    - MC 的 G_t 是整段未來的隨機和 → 單筆會劇烈擺盪到 ±幾十（高 variance）。
+        #    - TD 的 δ 只看一步           → 單筆穩穩落在 ~1（低 variance）。
+        #  SGD 每步乘的是「這個有雜訊的單筆估計」、不是期望，
+        #  所以 MC 單筆大 → 小 lr 就夠；TD 單筆小 → 要把 lr 放大才補得回來。
+        #
+        #  還有一個關鍵，解釋為什麼 TD 不只是「訊號小」而是初期根本沒方向：
+        #  上面「期望相同」只在 critic 準時才成立。訓練初期 V(s) ≈ 0：
+        #    - MC ≈ G_t - 0 = G_t：仍帶著真實 return 的資訊（mean ≈ 真實價值，幾十），
+        #                          就算 critic 沒用也學得動（本質退化成 REINFORCE）。
+        #    - TD ≈ r + 0 - 0 = r ≈ +1：真實資訊全丟了，而且 CartPole 每一步
+        #                          （含倒下那步）reward 都是 +1，於是「每一步」的
+        #                          advantage 都 ≈ +1，連失敗那步都是正的
+        #                          → actor 被告知「每個動作都很好」，完全沒方向
+        #                          （原 lr 實測 avg 卡在 ~13）。
+        #
+        #  小結，兩件事疊加：
+        #    1. critic_lr 調大：讓 V(s) 快點學準。critic 一準，δ 的符號才會對
+        #       （倒下那步的 δ 會變成大負值來懲罰），TD 才開始有意義。
+        #    2. actor_lr 調大：δ 單筆量級小，要放大 lr 才有足夠的更新力道。
+        #
+        #  代價：訓練會比 MC 版抖（偶爾回檔），原因有二：
+        #    (a) bootstrap 帶來 bias——δ 用 V(s') 估未來，V 不準時梯度方向會偏；
+        #        policy 一變 V 就過時，advantage 跟著退化而回檔。
+        #        MC 的 G_t 是無 bias 的真實 return，沒這問題。
+        #    (b) δ 動態範圍大——倒下那步 δ≈-35、其他步≈1，偶爾來一發大梯度就會晃。
+        #  這正是 TD 高 bias 的真實樣子
+        #  ——對應本檔開頭與 actor_critic.py docstring 的 MC vs TD 對照表。
+        # ══════════════════════════════════════════════════════════════════
         probs = self.actor.forward(states)          # (T, 2)
         one_hot = np.zeros_like(probs)
         one_hot[np.arange(T), actions] = 1.0
