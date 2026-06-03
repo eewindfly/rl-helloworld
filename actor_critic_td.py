@@ -56,8 +56,17 @@ class ACTDAgent:
         self.critic = CriticNetwork()
 
         self.gamma     = 0.99
-        self.actor_lr  = 0.0005
-        self.critic_lr = 0.001   # Critic 通常用較高學習率，讓 V(s) 快點準確
+        # ⚠️ 和 MC 版唯一要動的東西：學習率必須重調，不能照抄 MC 版！
+        #   公式（advantage、critic target）完全照教科書，沒有任何額外技巧。
+        #   原因見下方 update() 的「為何 MC 版的超參數搬過來會學不起來」。
+        #   - actor_lr 調大（0.0005 → 0.02，約 40x）：
+        #       TD advantage = δ 量級只有 O(1)，MC advantage = G_t - V 是 O(數十)，
+        #       照抄 0.0005 等於 actor 幾乎不動。
+        #   - critic_lr 調大（0.001 → 0.05）：
+        #       TD 是 bootstrap，critic 要夠準 advantage 才有意義，
+        #       必須讓 V(s) 快點學起來。
+        self.actor_lr  = 0.02
+        self.critic_lr = 0.05
 
         # 比 MC 版多存 next_state 和 done
         self._states      = []
@@ -116,7 +125,23 @@ class ACTDAgent:
         self.critic.backward(grad_v, self.critic_lr)
 
         # ── 步驟 5：更新 Actor ───────────────────────────────
-        #   和 MC 版完全相同，只是 advantage 換成 TD error
+        #   和 MC 版完全相同，只是 advantage 換成 TD error δ。
+        #   公式純教科書，沒有 normalize、沒有任何額外技巧。
+        #
+        #   ⚠️ 為何 MC 版的超參數搬過來會「學不起來」？（已在上方調 lr 修正）
+        #
+        #   CartPole 每一步（含倒下那步）reward 都是 +1。初期 critic 還沒學會，
+        #   V(s) ≈ 0，於是 advantage = r + γV(s') - V(s) ≈ +1 對「每一步」都成立，
+        #   連倒下那一步的 advantage 都是正的 → actor 被告知「每個動作都很好」，
+        #   完全學不到東西（原 lr 實測 avg 卡在 ~13）。
+        #
+        #   MC 版為何沒這問題？因為 MC advantage = G_t - V(s)，
+        #   主導項是真實 return G_t（O(數十)），就算 critic 很爛、符號也對得到。
+        #   TD advantage 完全由 critic 兩次輸出相減而來，critic 不準 → advantage 是雜訊；
+        #   且量級只有 O(1)（≈單一步的 δ），所以 actor_lr 必須調大、critic_lr 也要夠快。
+        #
+        #   代價：純 δ 不做 normalize，訓練會比 MC 版抖（偶爾回檔），
+        #         這正是 TD 高 bias / SGD 不穩的真實樣子——和 README 的對照一致。
         probs = self.actor.forward(states)          # (T, 2)
         one_hot = np.zeros_like(probs)
         one_hot[np.arange(T), actions] = 1.0
