@@ -114,7 +114,9 @@ class CriticNetwork:
         self.b2 -= lr * db2
 
     def predict_value(self, state):
-        return float(self.forward(state.reshape(1, -1)))
+        # forward 回傳 shape (1,) 的陣列，要先取出元素再轉純量
+        # （直接 float(陣列) 在新版 numpy 會丟 TypeError）
+        return float(self.forward(state.reshape(1, -1))[0])
 
 
 # ─────────────────────────────────────────────────────────
