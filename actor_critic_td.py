@@ -14,7 +14,8 @@ RL Hello World 4b — Actor-Critic (A2C) TD 版 on CartPole
     - TD target = r_t + γ × V(s_{t+1})
     - 每步立刻就能算，不需要等 episode 結束
     - 有 bias（V 不準就偏），但方差低（只往前看一步）
-    - terminal step：V(s_{t+1}) = 0（沒有下一個狀態）
+    - 真終止（terminated，桿子倒了）：V(s_{t+1}) = 0
+      ⚠️ 但「撐到時間上限被截斷」（truncated）不算真終止，V(s') 照常 bootstrap
 
 【TD error = Advantage】
 
@@ -29,10 +30,11 @@ RL Hello World 4b — Actor-Critic (A2C) TD 版 on CartPole
 
 【程式碼改動（相比 actor_critic.py）】
 
-  1. store() 多存 next_state 和 done
+  1. store() 多存 next_state、terminated、done
+     （terminated 給 V(s') 歸零；done 只給數軌跡數 N）
   2. 拿掉 compute_returns()（不再需要 G_t）
   3. update() 裡：
-       TD target  = r + γ × V(s')，terminal 時 V(s') = 0
+       TD target  = r + γ × V(s')，只有 terminated 時 V(s') = 0
        Advantage  = TD target - V(s)
        Critic loss = MSE(V(s), TD target)
   4. 更新時機不變：仍是 episode 結束後 batch 更新
@@ -69,22 +71,28 @@ class ACTDAgent:
         self.actor_lr  = 0.02
         self.critic_lr = 0.05
 
-        # 比 MC 版多存 next_state 和 done
+        # 比 MC 版多存 next_state、terminated、done
+        #   terminated：桿子真的倒了 → 真終止，V(s')=0
+        #   done       ：episode 結束（terminated 或 truncated）→ 只用來數軌跡數 N
+        #   ⚠️ 兩者要分開！truncated（撐到時間上限被截斷）算 done 但不算 terminated，
+        #      它的 s' 還有未來價值，不能把 V(s') 歸零。詳見 update()。
         self._states      = []
         self._actions     = []
         self._rewards     = []
         self._next_states = []
+        self._terminateds = []
         self._dones       = []
 
     def choose_action(self, state):
         probs = self.actor.predict_probs(state)
         return np.random.choice(len(probs), p=probs)
 
-    def store(self, state, action, reward, next_state, done):
+    def store(self, state, action, reward, next_state, terminated, done):
         self._states.append(state)
         self._actions.append(action)
         self._rewards.append(reward)
         self._next_states.append(next_state)
+        self._terminateds.append(terminated)
         self._dones.append(done)
 
     def update(self):
@@ -92,7 +100,8 @@ class ACTDAgent:
         actions     = np.array(self._actions)      # (T,)
         rewards     = np.array(self._rewards)      # (T,)
         next_states = np.array(self._next_states)  # (T, 4)
-        dones       = np.array(self._dones)        # (T,) bool
+        terminateds = np.array(self._terminateds)  # (T,) bool 真終止
+        dones       = np.array(self._dones)        # (T,) bool episode 結束
 
         T = len(rewards)
         N = int(dones.sum())   # 完整軌跡數（和 MC 版的 N 語意相同）
@@ -100,10 +109,15 @@ class ACTDAgent:
         # ── 步驟 1：算 TD target ──────────────────────────────
         #
         #   TD target = r + γ × V(s')
-        #   terminal step：done=True，V(s') = 0（沒有下一狀態）
+        #
+        #   ⚠️ V(s') 只在「真終止 terminated」時才歸零，不是 done！
+        #      - terminated（桿子倒了）：s' 真的沒有未來 → V(s')=0 正確。
+        #      - truncated（撐到 500 步上限被截斷）：桿子還立著，s' 還有未來價值，
+        #        必須照常用 V(s') bootstrap。若也歸零，等於告訴 critic
+        #        「撐到滿分的狀態價值是 0」，反而懲罰最好的軌跡 → 造成回檔。
         #
         next_values = self.critic.forward(next_states)   # (T,)
-        next_values[dones] = 0.0                         # terminal mask
+        next_values[terminateds] = 0.0                   # 只有真終止才歸零
         td_targets = rewards + self.gamma * next_values  # (T,)
 
         # ── 步驟 2：Critic 估 V(s) ───────────────────────────
@@ -185,6 +199,7 @@ class ACTDAgent:
         self._actions     = []
         self._rewards     = []
         self._next_states = []
+        self._terminateds = []
         self._dones       = []
 
 
@@ -219,8 +234,9 @@ def train():
             next_state, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
 
-            # 比 MC 版多傳 next_state 和 done
-            agent.store(state, action, reward, next_state, done)
+            # 比 MC 版多傳 next_state、terminated、done
+            #   terminated 給 V(s') 歸零用；done 只給數軌跡數用（見 store/update）
+            agent.store(state, action, reward, next_state, terminated, done)
             total_reward += reward
             state = next_state
 

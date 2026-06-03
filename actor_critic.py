@@ -146,22 +146,40 @@ class ACAgent:
         self._cur_actions.append(action)
         self._cur_rewards.append(reward)
 
-    def end_episode(self):
-        """Episode 結束，把這條軌跡存起來（和 PG 相同）"""
+    def end_episode(self, terminated, last_next_state):
+        """
+        Episode 結束，把這條軌跡存起來。
+
+        多存兩樣東西，給「截斷 bootstrap」用（見 compute_returns）：
+          terminated      ：是不是真終止（桿子倒了）。
+                            truncated（撐到時間上限被截斷）時為 False。
+          last_next_state ：這條軌跡最後一步的 s'，truncated 時要用它 bootstrap。
+        """
         self.trajectories.append((
             list(self._cur_states),
             list(self._cur_actions),
             list(self._cur_rewards),
+            terminated,
+            last_next_state,
         ))
         self._cur_states  = []
         self._cur_actions = []
         self._cur_rewards = []
 
-    def compute_returns(self, rewards):
-        """Monte Carlo return：從每一步開始的累積折扣獎勵 G_t"""
+    def compute_returns(self, rewards, terminated, last_next_state):
+        """
+        Monte Carlo return：從每一步開始的累積折扣獎勵 G_t
+
+        ⚠️ 累加起點 acc 不能無腦設 0！
+           - terminated（桿子倒了）：之後真的沒有未來獎勵 → acc 從 0 起算，正確。
+           - truncated（撐到 500 步上限被截斷）：桿子還立著，後面本來還有一大段
+             獎勵，只是被時間上限切掉。若 acc 從 0 起算，會把接近上限的那幾步
+             G_t 系統性低估（少算截斷後的尾巴），剛好打到「滿分軌跡」。
+             正確做法：用 critic 估的 V(last_next_state) 當尾巴 bootstrap。
+        """
         T = len(rewards)
         G = np.zeros(T)
-        acc = 0.0
+        acc = 0.0 if terminated else self.critic.predict_value(last_next_state)
         for t in reversed(range(T)):
             acc = rewards[t] + self.gamma * acc
             G[t] = acc
@@ -185,8 +203,8 @@ class ACAgent:
         all_actions  = []
         all_returns  = []
 
-        for states, actions, rewards in self.trajectories:
-            returns = self.compute_returns(rewards)
+        for states, actions, rewards, terminated, last_next_state in self.trajectories:
+            returns = self.compute_returns(rewards, terminated, last_next_state)
             all_states.extend(states)
             all_actions.extend(actions)
             all_returns.extend(returns)
@@ -260,7 +278,8 @@ def train():
             if done:
                 break
 
-        agent.end_episode()
+        # 傳 terminated（區分真終止 vs 截斷）和最後的 next_state（截斷時 bootstrap 用）
+        agent.end_episode(terminated, next_state)
         scores.append(total_reward)
 
         # 每收集 N_UPDATES 條軌跡才更新一次（和 PG 相同）
