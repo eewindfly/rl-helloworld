@@ -56,8 +56,8 @@ class ACTDAgent:
         self.critic = CriticNetwork()
 
         self.gamma     = 0.99
-        self.actor_lr  = 0.005
-        self.critic_lr = 0.01
+        self.actor_lr  = 0.0005
+        self.critic_lr = 0.001   # Critic 通常用較高學習率，讓 V(s) 快點準確
 
         # 比 MC 版多存 next_state 和 done
         self._states      = []
@@ -85,6 +85,7 @@ class ACTDAgent:
         dones       = np.array(self._dones)        # (T,) bool
 
         T = len(rewards)
+        N = int(dones.sum())   # 完整軌跡數（和 MC 版的 N 語意相同）
 
         # ── 步驟 1：算 TD target ──────────────────────────────
         #
@@ -119,7 +120,8 @@ class ACTDAgent:
         probs = self.actor.forward(states)          # (T, 2)
         one_hot = np.zeros_like(probs)
         one_hot[np.arange(T), actions] = 1.0
-        grad_logits = -(one_hot - probs) * advantage.reshape(-1, 1) / T
+        grad_logits = -(one_hot - probs) * advantage.reshape(-1, 1)
+        grad_logits /= N    # 除以軌跡數（和 MC 版相同）
         self.actor.backward(grad_logits, self.actor_lr)
 
         # 清空
@@ -138,8 +140,9 @@ def train():
     env   = gym.make("CartPole-v1")
     agent = ACTDAgent()
 
-    EPISODES = 1000
-    scores   = []
+    EPISODES  = 1000
+    N_UPDATES = 4     # 每收集幾條軌跡才更新一次（和 MC 版相同）
+    scores    = []
 
     print("=" * 60)
     print("  RL Hello World 4b — Actor-Critic (A2C) TD 版")
@@ -147,6 +150,7 @@ def train():
     print("\nTD Advantage：δ = r + γV(s') - V(s)")
     print("對比 MC    ：A = G_t - V(s)")
     print("差異       ：把 G_t 換成 r + γV(s')，其餘不變")
+    print(f"更新時機   ：每收集 {N_UPDATES} 條軌跡後更新（和 MC 版相同）")
     print("目標       ：近 50 回合平均分 ≥ 195 = 解決！")
     print(f"\n開始訓練 {EPISODES} 個 episodes...\n")
 
@@ -167,8 +171,11 @@ def train():
             if done:
                 break
 
-        agent.update()
         scores.append(total_reward)
+
+        # 每收集 N_UPDATES 條軌跡才更新一次（和 MC 版相同）
+        if (episode + 1) % N_UPDATES == 0:
+            agent.update()
 
         if (episode + 1) % 50 == 0:
             avg_score = np.mean(scores[-50:])
