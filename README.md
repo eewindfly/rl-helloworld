@@ -13,7 +13,7 @@
 | 2 | `dqn_cartpole.py` | DQN | CartPole-v1 | ✅ 完成 |
 | 3 | `pg_cartpole.py` | Policy Gradient (REINFORCE) | CartPole-v1 | ✅ 完成 |
 | 4 | `actor_critic.py` | Actor-Critic (A2C) | CartPole-v1 | ✅ 完成 |
-| 5 | `ppo_cartpole.py` | PPO | CartPole-v1 | ⬜ 待做 |
+| 5 | `ppo_cartpole.py` | PPO | CartPole-v1 | ✅ 完成 |
 | 6 | `ppo_custom_env.py` | PPO | 自訂環境 | ⬜ 待做 |
 
 ---
@@ -86,11 +86,13 @@ Critic → 學 value V(s)，評估狀態好不好
 
 ---
 
-### ⬜ 階段 5 — PPO on CartPole
-**核心概念：** Clipped Objective、on-policy vs off-policy
+### ✅ 階段 5 — PPO on CartPole
+**核心概念：** Clipped Objective、ratio、同批多 epoch 複用
 
-Actor-Critic 的問題：每次更新幅度不好控制，一步走太大就崩掉。
-PPO 用 clip 限制每次 policy 的更新幅度。
+Actor-Critic 的問題：每次更新幅度不好控制，一步走太大就崩掉；
+而且 on-policy 資料用一次就丟，樣本效率低。
+PPO 用 clip 限制每次 policy 的更新幅度，於是同一批資料可以安全地
+反覆更新好幾個 epoch。
 
 ```
 PPO Objective：
@@ -98,6 +100,19 @@ PPO Objective：
 
   r_t = π_new(a|s) / π_old(a|s)  （新舊 policy 的比值）
   → 比值偏離 1 太多就截斷，保守更新
+```
+
+**本檔定位（教科書核心版）：**
+只放 PPO 真正的核心——`ratio + clip`（ε=0.2）與「同批 K epoch ×
+minibatch 複用」；advantage 沿用階段 4 的單步 TD δ。
+刻意**不放** GAE、entropy bonus、共享網路、advantage 正規化等
+「標配但非核心」的技巧，讓 diff 精準隔離出「PPO = A2C + clip」。
+
+```
+相比 actor_critic_td.py 的唯一改動：
+  1. 更新前凍結 old_log_prob（π_old）與 advantage / TD target
+  2. 目標  log π · A  →  min(ratio·A, clip(ratio)·A)
+  3. 外層加「K epoch × minibatch」迴圈，重複用同一批資料
 ```
 
 **為什麼是終點：**
