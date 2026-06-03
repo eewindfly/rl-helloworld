@@ -128,8 +128,8 @@ class ACAgent:
 
         # 超參數
         self.gamma     = 0.99
-        self.actor_lr  = 0.005
-        self.critic_lr = 0.01   # Critic 通常用較高學習率，讓 V(s) 快點準確
+        self.actor_lr  = 0.0005
+        self.critic_lr = 0.001   # Critic 通常用較高學習率，讓 V(s) 快點準確
 
         # 存放多條軌跡（和 PG 相同）
         self.trajectories = []      # list of (states, actions, rewards)
