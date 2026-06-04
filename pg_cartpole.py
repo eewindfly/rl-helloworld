@@ -47,73 +47,71 @@ RL Hello World 3 — Policy Gradient (REINFORCE) on CartPole
 
   Actor-Critic 和 PPO 全部建立在這個基礎上。
   RLHF（ChatGPT 的訓練方式）用的是 PPO，而 PPO 是 Policy Gradient 的延伸。
+
+────────────────────────────────────────────────────────────
+【關於這版：從 numpy 手刻 → PyTorch】
+
+  階段 2~5 改用 PyTorch。和先前純 numpy 版本相比，演算法一個字都沒變，
+  只有「梯度怎麼算」這件事換了實作：
+
+    numpy 版：自己推 softmax 的梯度 (one_hot - probs)、自己寫 backward()、
+              手動 W -= lr * grad。
+    PyTorch ：forward 只寫到 loss，剩下 loss.backward() 由 autograd 自動
+              算出所有梯度，optimizer.step() 自動更新。
+
+  REINFORCE 在 PyTorch 裡乾淨到只剩三行：
+      log_probs = Categorical(logits).log_prob(actions)
+      loss      = -(log_probs * returns).mean()   ← 最大化 J = 最小化 -J
+      loss.backward(); opt.step()
+
+  你手刻過一次、知道 (one_hot - probs) 是怎麼來的，現在可以放心把它交給
+  autograd —— 這就是換框架的全部意義。
 """
 
 import numpy as np
+import torch
+import torch.nn as nn
+from torch.distributions import Categorical
 import gymnasium as gym
 from utils import demo
 
 
 # ─────────────────────────────────────────────────────────
-#  1. Policy Network（純 numpy）
+#  1. Policy Network（PyTorch）
 # ─────────────────────────────────────────────────────────
 
-class PolicyNetwork:
+class PolicyNetwork(nn.Module):
     """
-    Policy 網路：輸入狀態，輸出動作機率
-    架構：輸入(4) → 隱藏層(64, ReLU) → 輸出(2, Softmax)
+    Policy 網路：輸入狀態，輸出動作的 logits
+    架構：輸入(4) → 隱藏層(64, ReLU) → 輸出(2)
 
     和 DQN 的網路差異：
-      DQN：輸出 Q 值（任意實數）
-      PG ：輸出機率（0~1，加總為 1）→ 用 softmax 保證
+      DQN：輸出 Q 值（任意實數，直接拿來比大小）
+      PG ：輸出 logits → 經 softmax 變成機率（0~1，加總為 1）
+
+    為什麼 forward 回傳 logits 而不是 probs？
+      PyTorch 的 Categorical(logits=...) 接 logits，內部會用數值穩定的
+      log-softmax，比我們先 softmax 再取 log 更安全（不會 log(0)）。
+      手刻 numpy 版自己做了「減最大值」防 overflow，這裡 PyTorch 幫你做掉了。
     """
     def __init__(self, input_dim=4, hidden_dim=64, output_dim=2):
-        self.W1 = np.random.randn(input_dim, hidden_dim) * np.sqrt(2.0 / input_dim)
-        self.b1 = np.zeros(hidden_dim)
-        self.W2 = np.random.randn(hidden_dim, output_dim) * np.sqrt(2.0 / hidden_dim)
-        self.b2 = np.zeros(output_dim)
-
-    def softmax(self, x):
-        """數值穩定的 softmax：先減最大值防止 overflow"""
-        x = x - np.max(x, axis=-1, keepdims=True)
-        exp_x = np.exp(x)
-        return exp_x / exp_x.sum(axis=-1, keepdims=True)
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
 
     def forward(self, x):
-        """前向傳播，回傳動作機率"""
-        self.x  = x
-        self.h  = np.maximum(0, x @ self.W1 + self.b1)   # ReLU
-        logits  = self.h @ self.W2 + self.b2
-        self.probs = self.softmax(logits)
-        return self.probs
+        """前向傳播：狀態 → 每個動作的 logits（未經 softmax）"""
+        return self.net(x)
 
-    def backward(self, grad_logits, lr):
-        """
-        反向傳播
-        grad_logits：loss 對 softmax 輸入（logits）的梯度
-        """
-        # 輸出層
-        dW2 = self.h.T @ grad_logits
-        db2 = grad_logits.sum(axis=0)
-
-        # 隱藏層（ReLU 反向）
-        grad_h = grad_logits @ self.W2.T
-        grad_h[self.h <= 0] = 0
-
-        dW1 = self.x.T @ grad_h
-        db1 = grad_h.sum(axis=0)
-
-        # Gradient ascent（我們在最大化目標，所以加而不是減）
-        # 這裡統一用 -= 並讓外部傳入負梯度（等效）
-        self.W1 -= lr * dW1
-        self.b1 -= lr * db1
-        self.W2 -= lr * dW2
-        self.b2 -= lr * db2
-
+    @torch.no_grad()
     def predict_probs(self, state):
-        """單筆推論：輸入狀態，輸出動作機率"""
-        x = state.reshape(1, -1)
-        return self.forward(x)[0]
+        """單筆推論：numpy 狀態 → numpy 動作機率（給 choose_action / demo 用）"""
+        x = torch.as_tensor(state, dtype=torch.float32).unsqueeze(0)
+        logits = self.forward(x)
+        return torch.softmax(logits, dim=-1)[0].numpy()
 
 
 # ─────────────────────────────────────────────────────────
@@ -122,11 +120,16 @@ class PolicyNetwork:
 
 class PGAgent:
     def __init__(self):
-        self.policy_net  = PolicyNetwork()
+        self.policy_net = PolicyNetwork()
 
         # 超參數
         self.gamma = 0.99   # 折扣因子
         self.lr    = 0.01   # 學習率
+
+        # PyTorch 用 optimizer 取代手刻的 W -= lr * grad。
+        # Adam 是 RL 的事實標準（Spinning Up / CleanRL 全用它）：
+        # 它對每個參數自適應調整步長，比純 SGD 穩、好調。
+        self.optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=self.lr)
 
         # 存放多條軌跡（每條是一個 episode）
         self.trajectories = []      # list of (states, actions, rewards)
@@ -188,24 +191,25 @@ class PGAgent:
         """
         用收集到的 N 條軌跡更新 policy
 
-        對應公式：∇R̄_θ ≈ (1/N) Σ_n Σ_t R(τ^n) ∇log π(a_t^n | s_t^n)
-
-        每條軌跡先各自算 return，N 條全部收集完後統一 normalize。
-        除以 N 對應公式裡的 1/N（估計期望值）。
-
         REINFORCE 梯度公式：
           ∇J = Σ_t  ∇ log π(a_t | s_t) × G_t
 
-        ∇ log π(a_t | s_t) 對 softmax logits 的梯度：
-          令 p = softmax(logits)
-          ∂ log p[a] / ∂ logits = (1_{i=a} - p[i])
-          也就是：one-hot(a) - p
+        【手刻 numpy → PyTorch 的對照】
 
-        Loss（我們最大化 J，等效於最小化 -J）：
-          對 logits 的梯度 = -(one_hot(a) - p) × G_t
+          numpy 版要自己做這些：
+            probs = softmax(logits)
+            grad_logits = -(one_hot(a) - probs) × G_t      ← 自己推的 softmax 梯度
+            policy_net.backward(grad_logits, lr)           ← 自己寫的反向傳播
+
+          PyTorch 版只要寫到「loss 長什麼樣」，梯度自動算：
+            log_probs = Categorical(logits).log_prob(actions)
+            loss      = -(log_probs × G_t).mean()
+            loss.backward()                                 ← autograd 自動算 ∇
+            optimizer.step()                                ← 自動更新
+
+          (one_hot - probs) 沒有消失，它就是 autograd 對 log_prob 求導的結果，
+          只是現在不用你手算了。
         """
-        N = len(self.trajectories)
-
         # 每條軌跡各自算 return，再合併
         all_states   = []
         all_actions  = []
@@ -217,9 +221,9 @@ class PGAgent:
             all_actions.extend(actions)
             all_returns.extend(returns)
 
-        states  = np.array(all_states)
-        actions = np.array(all_actions)
-        returns = np.array(all_returns)
+        states  = torch.as_tensor(np.array(all_states),  dtype=torch.float32)
+        actions = torch.as_tensor(np.array(all_actions), dtype=torch.long)
+        returns = torch.as_tensor(np.array(all_returns), dtype=torch.float32)
 
         # N 條軌跡合併後統一 normalize，保留跨 episode 的相對差異
         # 注意：用全局 mean 當 baseline 有已知的系統性問題——
@@ -229,26 +233,20 @@ class PGAgent:
         # 正確做法是用 V(s) 當 baseline（Advantage = G_t - V(s)），
         # 針對每個狀態估出合理期望，這就是 Actor-Critic 要解決的問題。
         returns = (returns - returns.mean()) / (returns.std() + 1e-8)
-        T = len(states)
 
-        # 前向傳播
-        probs = self.policy_net.forward(states)   # (T, 2)
+        # 前向 → 機率分佈 → 取出實際動作的 log π(a|s)
+        logits    = self.policy_net(states)             # (T, 2)
+        dist      = Categorical(logits=logits)
+        log_probs = dist.log_prob(actions)              # (T,)
 
-        # 計算梯度：∂(-J) / ∂logits_t = -(one_hot(a_t) - probs_t) × G_t
-        #
-        # 跟 classification cross-entropy 的梯度非常像：
-        #   Classification：one_hot(y) - p          （每筆權重相同）
-        #   REINFORCE    ：(one_hot(a) - p) × G_t   （用 G_t 當權重）
-        # REINFORCE 可理解成「加權版 cross-entropy」，
-        # G_t 決定每個動作的學習力道：走得好的梯度大，走得差的梯度小或反向。
-        one_hot = np.zeros_like(probs)
-        one_hot[np.arange(T), actions] = 1.0
+        # Loss = -(Σ log π(a|s) × G_t)，最大化 J 等效於最小化 -J。
+        # 用 mean 取代手刻版的「/N」—— 整體 scale 交給 optimizer 吸收。
+        loss = -(log_probs * returns).mean()
 
-        grad_logits = -(one_hot - probs) * returns.reshape(-1, 1)
-        grad_logits /= N    # 對應公式的 1/N
-
-        # 反向傳播更新 policy
-        self.policy_net.backward(grad_logits, self.lr)
+        # 一行反向傳播 + 一行更新，取代整個手刻 backward()
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
 
         # 清空（on-policy：用完就丟）
         self.trajectories = []
@@ -268,7 +266,7 @@ def train():
     scores         = []
 
     print("=" * 60)
-    print("  RL Hello World 3 — Policy Gradient (REINFORCE)")
+    print("  RL Hello World 3 — Policy Gradient (REINFORCE) [PyTorch]")
     print("=" * 60)
     print("\n核心概念：直接學動作機率，不再學 Q 值")
     print(f"更新時機：每收集 {BATCH_EPISODES} 條軌跡後更新（Monte Carlo，N={BATCH_EPISODES}），共 {NUM_UPDATES} 次")
@@ -298,7 +296,7 @@ def train():
         if (episode + 1) % BATCH_EPISODES == 0:
             agent.update()
 
-        # 每 50 回合印進度，並更新最佳 policy
+        # 每 50 回合印進度
         if (episode + 1) % 50 == 0:
             avg_score = np.mean(scores[-50:])
             solved    = "✓ 解決！" if avg_score >= 195 else ""
