@@ -13,6 +13,10 @@ RL Hello World 2 — DQN on CartPole
     輸出：每個動作的 Q 值
     → 神經網路學會「泛化」，沒看過的狀態也能估出合理的 Q 值
 
+  ⚠️ 這也是整個系列「框架切換點」對齊「概念切換點」的地方：
+     階段 1（GridWorld）狀態少 → Q-table → 純 numpy 就夠。
+     階段 2 起狀態變連續 → 需要神經網路 → 改用 PyTorch。
+
 【CartPole 環境】
   狀態 (4 個數值)：
     - 小車位置
@@ -44,71 +48,66 @@ RL Hello World 2 — DQN on CartPole
      計算 target 時用 target_net（固定不動）
      每隔幾步才把 main_net 的參數複製給 target_net
      → 避免「追著自己的尾巴跑」導致訓練震盪
+
+────────────────────────────────────────────────────────────
+【關於這版：從 numpy 手刻 → PyTorch】
+
+  演算法（Bellman、replay、target net）一字未改，只有 NN 換成 PyTorch：
+
+    numpy 版：自己寫 SimpleNN.forward / backward、手動算 MSE 梯度
+              2*(pred-target)、手動只更新被選動作那一格。
+    PyTorch ：nn.Module 定義網路，q.gather(1, actions) 取被選動作的 Q，
+              F.mse_loss + loss.backward() + optimizer.step() 全自動。
+
+  兩個 numpy 版要小心手刻、這裡 PyTorch 一行解決的地方：
+    1. 「只更新被選動作的 Q」→ q_values.gather(1, actions)
+    2. 「target 不要回傳梯度」→ with torch.no_grad(): 包住 target 計算
+       （手刻版是靠「只把被選動作那格設成 target、其餘相減為 0」隱含達成）
 """
 
-import numpy as np
 import random
 from collections import deque
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import gymnasium as gym
 from utils import demo
 
 # ─────────────────────────────────────────────────────────
-#  1. 簡單神經網路（純 numpy 實作，看清楚內部）
+#  1. Q 網路（PyTorch）
 # ─────────────────────────────────────────────────────────
 
-class SimpleNN:
+class QNetwork(nn.Module):
     """
     兩層全連接神經網路
-    架構：輸入(4) → 隱藏層(64, ReLU) → 輸出(2)
+    架構：輸入(4) → 隱藏層(64, ReLU) → 輸出(2 個動作的 Q 值)
 
     為什麼要 ReLU？
       讓網路能學非線性函數。CartPole 的 Q 值跟狀態的關係是非線性的，
       純線性層無論疊幾層都只能學線性關係。
+
+    對比手刻 numpy 版：
+      numpy 版自己寫 Xavier 初始化、forward 的 ReLU、backward 的鏈式法則。
+      PyTorch 的 nn.Linear 已內建合理初始化，autograd 自動處理 backward。
     """
     def __init__(self, input_dim=4, hidden_dim=64, output_dim=2):
-        # Xavier 初始化：讓各層輸出的方差接近 1，避免梯度消失/爆炸
-        self.W1 = np.random.randn(input_dim, hidden_dim) * np.sqrt(2.0 / input_dim)
-        self.b1 = np.zeros(hidden_dim)
-        self.W2 = np.random.randn(hidden_dim, output_dim) * np.sqrt(2.0 / hidden_dim)
-        self.b2 = np.zeros(output_dim)
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+        )
 
     def forward(self, x):
-        """前向傳播：輸入狀態 → 輸出每個動作的 Q 值"""
-        self.x   = x
-        self.h   = np.maximum(0, x @ self.W1 + self.b1)   # ReLU
-        self.out = self.h @ self.W2 + self.b2
-        return self.out
+        """前向傳播：狀態 → 每個動作的 Q 值"""
+        return self.net(x)
 
-    def backward(self, grad_out, lr):
-        """反向傳播：用鏈式法則算梯度，更新權重"""
-        # 輸出層梯度
-        dW2 = self.h.T @ grad_out
-        db2 = grad_out.sum(axis=0)
-
-        # 隱藏層梯度（ReLU 的導數：正值為1，負值為0）
-        grad_h = grad_out @ self.W2.T
-        grad_h[self.h <= 0] = 0    # ReLU 反向
-
-        dW1 = self.x.T @ grad_h
-        db1 = grad_h.sum(axis=0)
-
-        # Gradient descent 更新
-        self.W1 -= lr * dW1
-        self.b1 -= lr * db1
-        self.W2 -= lr * dW2
-        self.b2 -= lr * db2
-
-    def copy_from(self, other):
-        """複製另一個網路的參數（用於 target network 更新）"""
-        self.W1 = other.W1.copy()
-        self.b1 = other.b1.copy()
-        self.W2 = other.W2.copy()
-        self.b2 = other.b2.copy()
-
+    @torch.no_grad()
     def predict(self, state):
-        """單筆預測（inference 用）"""
-        x = state.reshape(1, -1)
-        return self.forward(x)[0]
+        """單筆推論：numpy 狀態 → numpy Q 值（給 choose_action / demo 用）"""
+        x = torch.as_tensor(state, dtype=torch.float32).unsqueeze(0)
+        return self.forward(x)[0].numpy()
 
 
 # ─────────────────────────────────────────────────────────
@@ -147,15 +146,17 @@ class ReplayBuffer:
 
 class DQNAgent:
     def __init__(self):
-        self.main_net   = SimpleNN()    # 主網路：持續被訓練
-        self.target_net = SimpleNN()    # 目標網路：定期同步，計算 target 用
-        self.target_net.copy_from(self.main_net)
+        self.main_net   = QNetwork()    # 主網路：持續被訓練
+        self.target_net = QNetwork()    # 目標網路：定期同步，計算 target 用
+        self.target_net.load_state_dict(self.main_net.state_dict())
+
+        # Adam 取代手刻的 W -= lr * grad
+        self.optimizer = torch.optim.Adam(self.main_net.parameters(), lr=0.001)
 
         self.replay_buffer = ReplayBuffer(capacity=10000)
 
         # 超參數
         self.gamma       = 0.99    # 折扣因子（CartPole 需要考慮長遠，設高一點）
-        self.lr          = 0.001   # 學習率
         self.batch_size  = 64      # 每次訓練抽多少筆
         self.epsilon     = 1.0     # 探索率
         self.epsilon_min = 0.01
@@ -177,30 +178,37 @@ class DQNAgent:
         states, actions, rewards, next_states, dones = \
             self.replay_buffer.sample(self.batch_size)
 
-        # 用 main_net 計算目前的 Q 值
-        q_values = self.main_net.forward(states)          # shape: (batch, 2)
+        states      = torch.as_tensor(states,      dtype=torch.float32)
+        actions     = torch.as_tensor(actions,     dtype=torch.long)
+        rewards     = torch.as_tensor(rewards,     dtype=torch.float32)
+        next_states = torch.as_tensor(next_states, dtype=torch.float32)
+        dones       = torch.as_tensor(dones,       dtype=torch.float32)
 
-        # 用 target_net 計算下一步的最大 Q 值（Bellman target）
-        next_q   = self.target_net.forward(next_states)   # shape: (batch, 2)
-        max_next_q = np.max(next_q, axis=1)               # shape: (batch,)
+        # 目前的 Q(s, a)：先算所有動作的 Q，再用 gather 取「實際執行的那個動作」
+        #   gather 取代手刻版「q_target[arange, actions] = targets，其餘相減為 0」
+        #   的技巧——只讓被選動作那一格參與 loss，梯度自然只流過它。
+        q_values = self.main_net(states)                          # (batch, 2)
+        q_sa     = q_values.gather(1, actions.unsqueeze(1)).squeeze(1)  # (batch,)
 
-        # target = r + γ · max Q(s', a')（終止狀態只有 r）
-        targets = rewards + self.gamma * max_next_q * (1 - dones)
+        # Bellman target = r + γ · max Q(s', a')（終止狀態只有 r）
+        #   用 no_grad 包住：target 是「固定目標」，不該對它回傳梯度。
+        #   （手刻版是靠 target_net 不參與 backward 隱含做到這件事。）
+        with torch.no_grad():
+            next_q     = self.target_net(next_states)            # (batch, 2)
+            max_next_q = next_q.max(dim=1).values                # (batch,)
+            targets    = rewards + self.gamma * max_next_q * (1 - dones)
 
-        # 只更新實際執行的那個動作的 Q 值，其他動作保持不變
-        # （這樣 gradient 只流過被選中的動作）
-        q_target = q_values.copy()
-        q_target[np.arange(self.batch_size), actions] = targets
+        # MSE loss + 自動反向傳播 + 自動更新
+        loss = F.mse_loss(q_sa, targets)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
 
-        # MSE loss 的梯度：2 * (預測 - 目標) / batch_size
-        grad = 2 * (q_values - q_target) / self.batch_size
+        return loss.item()
 
-        # 反向傳播更新 main_net
-        self.main_net.backward(grad, self.lr)
-
-        # 計算 loss（純用來觀察訓練是否穩定）
-        loss = np.mean((q_values - q_target) ** 2)
-        return loss
+    def sync_target(self):
+        """把 main_net 的參數複製給 target_net"""
+        self.target_net.load_state_dict(self.main_net.state_dict())
 
     def decay_epsilon(self):
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
@@ -218,7 +226,7 @@ def train():
     scores   = []
 
     print("=" * 55)
-    print("  RL Hello World 2 — DQN on CartPole")
+    print("  RL Hello World 2 — DQN on CartPole [PyTorch]")
     print("=" * 55)
     print("\n狀態空間：4 個連續數值（無法用 Q-table）")
     print("動作空間：向左(0) / 向右(1)")
@@ -254,7 +262,7 @@ def train():
 
         # 定期同步 target network
         if (episode + 1) % agent.target_update_freq == 0:
-            agent.target_net.copy_from(agent.main_net)
+            agent.sync_target()
 
         # 每 20 回合印進度
         if (episode + 1) % 20 == 0:
