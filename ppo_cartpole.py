@@ -178,9 +178,10 @@ def train():
     env   = gym.make("CartPole-v1")
     agent = PPOAgent()
 
-    EPISODES   = 1000
-    UPDATE_EVERY = 8     # 每收集 8 條軌跡才更新一次（PPO 喜歡大一點的 batch）
-    scores     = []
+    BATCH_EPISODES = 8     # 每收集 8 條軌跡才更新一次（batch size，PPO 喜歡大一點的 batch）
+    NUM_UPDATES    = 125   # 總共要更新幾次（真正決定學不學得起來的量）
+    EPISODES       = BATCH_EPISODES * NUM_UPDATES
+    scores         = []
 
     print("=" * 60)
     print("  RL Hello World 5 — PPO (PPO-Clip)")
@@ -210,7 +211,7 @@ def train():
         scores.append(total_reward)
         ep_in_batch += 1
 
-        if ep_in_batch == UPDATE_EVERY:
+        if ep_in_batch == BATCH_EPISODES:
             agent.update()
             ep_in_batch = 0
 

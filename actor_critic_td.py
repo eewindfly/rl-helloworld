@@ -211,9 +211,10 @@ def train():
     env   = gym.make("CartPole-v1")
     agent = ACTDAgent()
 
-    EPISODES  = 1000
-    N_UPDATES = 4     # 每收集幾條軌跡才更新一次（和 MC 版相同）
-    scores    = []
+    BATCH_EPISODES = 4     # 每收集幾條軌跡才更新一次（batch size，和 MC 版相同）
+    NUM_UPDATES    = 250   # 總共要更新幾次（真正決定學不學得起來的量）
+    EPISODES       = BATCH_EPISODES * NUM_UPDATES
+    scores         = []
 
     print("=" * 60)
     print("  RL Hello World 4b — Actor-Critic (A2C) TD 版")
@@ -221,7 +222,7 @@ def train():
     print("\nTD Advantage：δ = r + γV(s') - V(s)")
     print("對比 MC    ：A = G_t - V(s)")
     print("差異       ：把 G_t 換成 r + γV(s')，其餘不變")
-    print(f"更新時機   ：每收集 {N_UPDATES} 條軌跡後更新（和 MC 版相同）")
+    print(f"更新時機   ：每收集 {BATCH_EPISODES} 條軌跡後更新（和 MC 版相同），共 {NUM_UPDATES} 次")
     print("目標       ：近 50 回合平均分 ≥ 195 = 解決！")
     print(f"\n開始訓練 {EPISODES} 個 episodes...\n")
 
@@ -245,8 +246,8 @@ def train():
 
         scores.append(total_reward)
 
-        # 每收集 N_UPDATES 條軌跡才更新一次（和 MC 版相同）
-        if (episode + 1) % N_UPDATES == 0:
+        # 每收集 BATCH_EPISODES 條軌跡才更新一次（和 MC 版相同）
+        if (episode + 1) % BATCH_EPISODES == 0:
             agent.update()
 
         if (episode + 1) % 50 == 0:

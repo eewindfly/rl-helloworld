@@ -251,16 +251,17 @@ def train():
     env   = gym.make("CartPole-v1")
     agent = ACAgent()
 
-    EPISODES  = 1000
-    N_UPDATES = 4     # 每收集幾條軌跡才更新一次（和 PG 相同）
-    scores    = []
+    BATCH_EPISODES = 4     # 每收集幾條軌跡才更新一次（batch size，和 PG 相同）
+    NUM_UPDATES    = 250   # 總共要更新幾次（真正決定學不學得起來的量）
+    EPISODES       = BATCH_EPISODES * NUM_UPDATES
+    scores         = []
 
     print("=" * 60)
     print("  RL Hello World 4 — Actor-Critic (A2C)")
     print("=" * 60)
     print("\n核心概念：Advantage = G_t - V(s)，Critic 降低梯度方差")
     print("兩個網路：Actor（學機率）+ Critic（學狀態價值）")
-    print(f"更新時機：每收集 {N_UPDATES} 條軌跡後更新（和 PG 相同）")
+    print(f"更新時機：每收集 {BATCH_EPISODES} 條軌跡後更新（和 PG 相同），共 {NUM_UPDATES} 次")
     print("目標    ：近 50 回合平均分 ≥ 195 = 解決！")
     print(f"\n開始訓練 {EPISODES} 個 episodes...\n")
 
@@ -284,8 +285,8 @@ def train():
         agent.end_episode(terminated, next_state)
         scores.append(total_reward)
 
-        # 每收集 N_UPDATES 條軌跡才更新一次（和 PG 相同）
-        if (episode + 1) % N_UPDATES == 0:
+        # 每收集 BATCH_EPISODES 條軌跡才更新一次（和 PG 相同）
+        if (episode + 1) % BATCH_EPISODES == 0:
             agent.update()
 
         if (episode + 1) % 50 == 0:

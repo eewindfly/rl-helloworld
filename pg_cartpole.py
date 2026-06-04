@@ -262,15 +262,16 @@ def train():
     env   = gym.make("CartPole-v1")
     agent = PGAgent()
 
-    EPISODES  = 1000
-    N_UPDATES = 4     # 每收集幾條軌跡才更新一次（N in the formula）
-    scores    = []
+    BATCH_EPISODES = 4     # 每收集幾條軌跡才更新一次（公式裡的 N，也是 batch size）
+    NUM_UPDATES    = 250   # 總共要更新幾次（真正決定學不學得起來的量）
+    EPISODES       = BATCH_EPISODES * NUM_UPDATES
+    scores         = []
 
     print("=" * 60)
     print("  RL Hello World 3 — Policy Gradient (REINFORCE)")
     print("=" * 60)
     print("\n核心概念：直接學動作機率，不再學 Q 值")
-    print(f"更新時機：每收集 {N_UPDATES} 條軌跡後更新（Monte Carlo，N={N_UPDATES}）")
+    print(f"更新時機：每收集 {BATCH_EPISODES} 條軌跡後更新（Monte Carlo，N={BATCH_EPISODES}），共 {NUM_UPDATES} 次")
     print("目標    ：近 50 回合平均分 ≥ 195 = 解決！")
     print(f"\n開始訓練 {EPISODES} 個 episodes...\n")
 
@@ -293,8 +294,8 @@ def train():
         agent.end_episode()
         scores.append(total_reward)
 
-        # 每收集 N_UPDATES 條軌跡才更新一次
-        if (episode + 1) % N_UPDATES == 0:
+        # 每收集 BATCH_EPISODES 條軌跡才更新一次
+        if (episode + 1) % BATCH_EPISODES == 0:
             agent.update()
 
         # 每 50 回合印進度，並更新最佳 policy
