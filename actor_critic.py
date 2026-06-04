@@ -203,6 +203,7 @@ class ACAgent:
           5. 更新 Actor ：用 Advantage 替換 REINFORCE 的 G_t
         """
         # 步驟 1：每條軌跡各自算 return，再合併（和 PG 相同）
+        N = len(self.trajectories)   # 軌跡數，對應公式裡的 N
         all_states   = []
         all_actions  = []
         all_returns  = []
@@ -236,7 +237,7 @@ class ACAgent:
         logits    = self.actor(states)            # (T, 2)
         dist      = Categorical(logits=logits)
         log_probs = dist.log_prob(actions)        # (T,)
-        actor_loss = -(log_probs * advantage).mean()
+        actor_loss = -(log_probs * advantage).sum() / N
         self.actor_opt.zero_grad()
         actor_loss.backward()
         self.actor_opt.step()
