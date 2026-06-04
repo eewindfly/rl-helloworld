@@ -12,8 +12,9 @@
 | 1 | `rl_helloworld.py` | Q-Learning | GridWorld (4×4) | ✅ 完成 |
 | 2 | `dqn_cartpole.py` | DQN | CartPole-v1 | ✅ 完成 |
 | 3 | `pg_cartpole.py` | Policy Gradient (REINFORCE) | CartPole-v1 | ✅ 完成 |
-| 4 | `actor_critic.py` | Actor-Critic (A2C) | CartPole-v1 | ✅ 完成 |
-| 5 | `ppo_cartpole.py` | PPO | CartPole-v1 | ✅ 完成 |
+| 4 | `actor_critic.py` | Actor-Critic (A2C, MC) | CartPole-v1 | ✅ 完成 |
+| 4b | `actor_critic_td.py` | Actor-Critic (A2C, TD) | CartPole-v1 | ✅ 完成 |
+| 5 | `ppo_cartpole.py` | PPO (PPO-Clip) | CartPole-v1 | ✅ 完成 |
 | 6 | `ppo_custom_env.py` | PPO | 自訂環境 | ⬜ 待做 |
 
 ---
@@ -50,7 +51,7 @@ Q-table 直接存每個 (s, a) 的預期獎勵。
 
 ---
 
-### ⬜ 階段 3 — Policy Gradient on CartPole
+### ✅ 階段 3 — Policy Gradient on CartPole
 **核心概念：** Policy-based vs Value-based、REINFORCE、Monte Carlo return
 
 DQN 學的是「Q 值」，動作從 argmax 推出來（間接）。
@@ -70,7 +71,7 @@ RLHF（ChatGPT 的訓練方式）用的就是 PPO。
 
 ---
 
-### ⬜ 階段 4 — Actor-Critic (A2C)
+### ✅ 階段 4 — Actor-Critic (A2C，MC 版)
 **核心概念：** Baseline、Advantage、Actor + Critic 雙網路
 
 Policy Gradient 的問題：G_t 的方差很大，訓練不穩定。
@@ -83,6 +84,27 @@ Advantage = Q(s,a) - V(s)
 Actor  → 學 policy π(a|s)，決定動作
 Critic → 學 value V(s)，評估狀態好不好
 ```
+
+---
+
+### ✅ 階段 4b — Actor-Critic (A2C，TD 版)
+**核心概念：** TD target、TD error = Advantage、bootstrap
+
+和階段 4 唯一的差別：把 MC return 換成 TD target。
+不用等整個 episode 跑完，每走一步就能算 advantage。
+
+```
+MC 版（階段 4）：G_t = 到 episode 結尾的累積折扣獎勵
+  → 無 bias，但方差高，要等 episode 結束
+
+TD 版（本檔）：δ_t = r_t + γ × V(s_{t+1}) - V(s_t)
+  → 有 bias、方差低，每步即時可算
+  → 這個 δ_t 就是 TD 版的 Advantage
+
+⚠️ terminated（桿子倒）：V(s')=0；truncated（時間截斷）：V(s') 照常 bootstrap
+```
+
+這版是 PPO 的直接前身——階段 5 的 advantage 就沿用這裡的單步 TD δ。
 
 ---
 
@@ -104,7 +126,7 @@ PPO Objective：
 
 **本檔定位（教科書核心版）：**
 只放 PPO 真正的核心——`ratio + clip`（ε=0.2）與「同批 K epoch ×
-minibatch 複用」；advantage 沿用階段 4 的單步 TD δ。
+minibatch 複用」；advantage 沿用階段 4b 的單步 TD δ。
 刻意**不放** GAE、entropy bonus、共享網路、advantage 正規化等
 「標配但非核心」的技巧，讓 diff 精準隔離出「PPO = A2C + clip」。
 
@@ -140,7 +162,8 @@ RLHF 的 reward model 訓練完之後，用 PPO 微調語言模型。
 └── Policy-based（學 policy）
     ├── Policy Gradient / REINFORCE   ← 階段 3
     └── Actor-Critic
-        ├── A2C              ← 階段 4
+        ├── A2C (MC)         ← 階段 4
+        ├── A2C (TD)         ← 階段 4b
         └── PPO              ← 階段 5、6
 ```
 
@@ -166,13 +189,20 @@ RLHF 的 reward model 訓練完之後，用 PPO 微調語言模型。
 
 ## 環境設定
 
+只依賴 `numpy` 和 `gymnasium`，神經網路全部用純 numpy 手刻，不需要 PyTorch / TensorFlow。
+
 ```bash
-pip install numpy gymnasium
+pip install -r requirements.txt
+# 或手動： pip install "gymnasium[classic-control]" numpy
 ```
 
 執行範例：
 
 ```bash
-python rl_helloworld.py    # 階段 1
-python dqn_cartpole.py     # 階段 2
+python rl_helloworld.py     # 階段 1  Q-Learning
+python dqn_cartpole.py      # 階段 2  DQN
+python pg_cartpole.py       # 階段 3  Policy Gradient
+python actor_critic.py      # 階段 4  A2C (MC)
+python actor_critic_td.py   # 階段 4b A2C (TD)
+python ppo_cartpole.py      # 階段 5  PPO
 ```
