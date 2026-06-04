@@ -203,7 +203,7 @@ class PGAgent:
 
           PyTorch 版只要寫到「loss 長什麼樣」，梯度自動算：
             log_probs = Categorical(logits).log_prob(actions)
-            loss      = -(log_probs × G_t).mean()
+            loss      = -(log_probs × G_t).sum() / N       ← 對應公式的 1/N
             loss.backward()                                 ← autograd 自動算 ∇
             optimizer.step()                                ← 自動更新
 
@@ -211,6 +211,7 @@ class PGAgent:
           只是現在不用你手算了。
         """
         # 每條軌跡各自算 return，再合併
+        N = len(self.trajectories)   # 軌跡數，對應公式裡的 N
         all_states   = []
         all_actions  = []
         all_returns  = []
@@ -239,9 +240,10 @@ class PGAgent:
         dist      = Categorical(logits=logits)
         log_probs = dist.log_prob(actions)              # (T,)
 
-        # Loss = -(Σ log π(a|s) × G_t)，最大化 J 等效於最小化 -J。
-        # 用 mean 取代手刻版的「/N」—— 整體 scale 交給 optimizer 吸收。
-        loss = -(log_probs * returns).mean()
+        # Loss = -(1/N) Σ_n Σ_t log π(a_t|s_t) × G_t，對應公式的 1/N。
+        # .mean() 會除以總 timestep 數 T（= N × avg_episode_len），
+        # 和公式的 /N 相差一個 avg_episode_len，所以用 .sum() / N。
+        loss = -(log_probs * returns).sum() / N
 
         # 一行反向傳播 + 一行更新，取代整個手刻 backward()
         self.optimizer.zero_grad()
