@@ -59,7 +59,7 @@ Policy Gradient 直接學「動作機率」，網路輸出 softmax。
 
 ```
 核心公式：
-  ∇J = Σ log π(a|s) × G_t
+  ∇J = Σ ∇log π(a|s) × G_t
 
   G_t = 從這步開始到結尾的累積獎勵（Monte Carlo）
   → 做對了的動作，提高它的機率；做錯了的，降低
