@@ -137,9 +137,18 @@ minibatch 複用」；advantage 沿用階段 4b 的單步 TD δ。
   3. 外層加「K epoch × minibatch」迴圈，重複用同一批資料
 ```
 
-**為什麼是終點：**
-PPO 是目前最常用的 RL 演算法，OpenAI、DeepMind 的大多數工作都用它。
-RLHF 的 reward model 訓練完之後，用 PPO 微調語言模型。
+**為什麼以 PPO 收尾：**
+PPO 長期是 RLHF 的標準引擎——在經典流程裡，reward model 訓練完之後，
+就是用 PPO 拿它當分數來微調語言模型（InstructGPT / 早期 ChatGPT 就是這樣）。
+它穩定、通用，是理解現代 LLM 對齊的基礎。
+
+不過 2024 年起這塊已經分流出更新的方法，值得知道：
+  - DPO：跳過獨立 reward model 與 PPO，直接用偏好資料優化，較簡單
+  - GRPO：拿掉 critic，一個 prompt 生一組答案互相比較
+          （DeepSeek R1 用它訓練推理模型，現為開源界主流）
+  - 大趨勢：從「學出來的 reward model」轉向 verifiable rewards（程式自動驗對錯）
+
+換句話說，PPO 不是 RL 的句點，而是看懂後續這些方法的起點。
 
 ---
 
