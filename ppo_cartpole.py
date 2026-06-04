@@ -37,9 +37,29 @@ RL Hello World 5 — PPO (PPO-Clip) on CartPole
         advantage 是負的（這動作差）→ ratio 往下，同理夾在 1-ε。
   取 min 的巧妙：只在「會讓目標變好」的方向限制；若新策略已經
   變差（往錯方向跑），min 會選未截斷項，讓梯度照常把它拉回來。
+
+────────────────────────────────────────────────────────────
+【關於這版：從 numpy 手刻 → PyTorch（PPO 受益最大）】
+
+  手刻 numpy 版最容易出錯的就是 clip 的「梯度遮罩」：
+    L^CLIP = min(unclipped, clipped) 在被 clip 那側、ratio 飽和時，
+    clip 的導數是 0 → 該樣本不更新。numpy 版要自己算一個
+    use_grad = (unclipped <= clipped) 的 mask，再手動套進梯度。
+
+  PyTorch 版完全不用管這件事：
+    surr1 = ratio * adv
+    surr2 = clamp(ratio, 1-ε, 1+ε) * adv
+    loss  = -min(surr1, surr2).mean()
+    loss.backward()
+  torch.min 和 torch.clamp 都帶正確的「次梯度」，autograd 會自動讓
+  梯度只從被選中、且沒被 clamp 飽和的那一路流回去——你手刻過的 mask
+  其實就是這個次梯度，現在交給 autograd。
 """
 
 import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.distributions import Categorical
 import gymnasium as gym
 from utils import demo
 from pg_cartpole import PolicyNetwork as ActorNetwork
@@ -55,12 +75,14 @@ class PPOAgent:
         self.actor  = ActorNetwork()
         self.critic = CriticNetwork()
 
-        self.gamma   = 0.99
+        self.gamma = 0.99
         # PPO 一次收一批資料要反覆更新 K_EPOCHS 次，等於同一批資料
-        # 被「重用 K 次」，所以單次 lr 要比 A2C(TD) 的 0.02 小一點，
-        # 否則累積更新過頭。critic 仍要夠快學準（bootstrap 靠它）。
-        self.actor_lr  = 0.003
-        self.critic_lr = 0.01
+        # 被「重用 K 次」，所以單次 lr 要比 A2C(TD) 小一點，否則累積更新過頭。
+        self.actor_lr  = 0.0015
+        self.critic_lr = 0.005
+
+        self.actor_opt  = torch.optim.Adam(self.actor.parameters(),  lr=self.actor_lr)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=self.critic_lr)
 
         # ── PPO 核心超參 ──
         self.clip_eps     = 0.2   # ε：ratio 被夾在 [1-ε, 1+ε]
@@ -90,39 +112,37 @@ class PPOAgent:
         self._dones.append(done)
 
     def update(self):
-        states      = np.array(self._states)       # (T, 4)
-        actions     = np.array(self._actions)      # (T,)
-        rewards     = np.array(self._rewards)       # (T,)
-        next_states = np.array(self._next_states)  # (T, 4)
-        terminateds = np.array(self._terminateds)  # (T,) bool 真終止
-        T = len(rewards)
+        states      = torch.as_tensor(np.array(self._states),      dtype=torch.float32)  # (T,4)
+        actions     = torch.as_tensor(np.array(self._actions),     dtype=torch.long)     # (T,)
+        rewards     = torch.as_tensor(np.array(self._rewards),     dtype=torch.float32)  # (T,)
+        next_states = torch.as_tensor(np.array(self._next_states), dtype=torch.float32)  # (T,4)
+        terminateds = torch.as_tensor(np.array(self._terminateds), dtype=torch.bool)     # (T,)
+        T = len(self._rewards)
 
         # ══════════════════════════════════════════════════════════
         #  Phase 1：更新前，用「舊策略 / 舊 critic」算好並凍結
-        #           （以下三樣在整個 K-epoch 過程中都不變）
+        #           （no_grad → 這三樣在整個 K-epoch 過程中都是常數）
         # ══════════════════════════════════════════════════════════
+        with torch.no_grad():
+            # (a) old_log_prob = log π_old(a|s)：此刻的 actor 就是 π_old
+            old_logits    = self.actor(states)                       # (T, 2)
+            old_log_probs = Categorical(logits=old_logits).log_prob(actions)  # (T,)
 
-        # (a) old_log_prob = log π_old(a|s)
-        #     此刻的 actor 就是收集這批資料的策略 π_old。
-        #     .copy() 凍結，後續 actor 更新不會動到它。
-        old_probs_all   = self.actor.forward(states)            # (T, 2)
-        old_log_probs   = np.log(old_probs_all[np.arange(T), actions] + 1e-10).copy()
+            # (b) TD target = r + γV(s')，只有真終止才把 V(s') 歸零
+            #     （truncated 照常 bootstrap —— 和 TD 版完全相同的處理）
+            next_values = self.critic(next_states)                   # (T,)
+            next_values[terminateds] = 0.0
+            td_targets = rewards + self.gamma * next_values          # (T,)
 
-        # (b) TD target = r + γV(s')，只有真終止才把 V(s') 歸零
-        #     （truncated 照常 bootstrap —— 和 TD 版完全相同的處理）
-        next_values = self.critic.forward(next_states)          # (T,)
-        next_values[terminateds] = 0.0
-        td_targets = (rewards + self.gamma * next_values).copy()  # (T,)
-
-        # (c) advantage = TD target - V_old(s)，單步 TD δ（不用 GAE）
-        old_values = self.critic.forward(states)                # (T,)
-        advantages = (td_targets - old_values).copy()           # (T,)
+            # (c) advantage = TD target - V_old(s)，單步 TD δ（不用 GAE）
+            old_values = self.critic(states)                         # (T,)
+            advantages = td_targets - old_values                     # (T,)
 
         # ══════════════════════════════════════════════════════════
         #  Phase 2：同一批資料，跑 K 個 epoch，每 epoch 切 minibatch
         # ══════════════════════════════════════════════════════════
         for _ in range(self.k_epochs):
-            idx = np.random.permutation(T)        # 每個 epoch 重新洗牌
+            idx = torch.randperm(T)               # 每個 epoch 重新洗牌
             for start in range(0, T, self.minibatch_sz):
                 mb = idx[start:start + self.minibatch_sz]
                 mb_states  = states[mb]
@@ -130,36 +150,30 @@ class PPOAgent:
                 mb_adv     = advantages[mb]
                 mb_oldlogp = old_log_probs[mb]
                 mb_target  = td_targets[mb]
-                m = len(mb)
 
                 # ── 更新 Actor：clipped surrogate ──────────────
-                probs = self.actor.forward(mb_states)           # (m, 2)
-                new_logp = np.log(probs[np.arange(m), mb_actions] + 1e-10)
+                logits   = self.actor(mb_states)                     # (m, 2)
+                new_logp = Categorical(logits=logits).log_prob(mb_actions)  # (m,)
 
-                ratio     = np.exp(new_logp - mb_oldlogp)       # π_new / π_old
-                unclipped = ratio * mb_adv
-                clipped   = np.clip(ratio, 1 - self.clip_eps,
+                ratio = torch.exp(new_logp - mb_oldlogp)             # π_new / π_old
+                surr1 = ratio * mb_adv
+                surr2 = torch.clamp(ratio, 1 - self.clip_eps,
                                            1 + self.clip_eps) * mb_adv
 
-                # L^CLIP = min(unclipped, clipped)，我們要最大化它。
-                # 梯度只在「min 選到未截斷項」時流動；選到截斷項且
-                # ratio 已飽和時，clip 的導數為 0 → 該樣本不更新。
-                # 用 mask 表示：unclipped <= clipped 時取 ratio 的梯度。
-                use_grad = (unclipped <= clipped).astype(np.float64)   # (m,)
-
-                # ∇log π_a 對 logits = (one_hot - probs)
-                # ∇ratio = ratio · ∇log π_a
-                # 最大化 → loss = -L^CLIP → grad_logits 帶負號
-                one_hot = np.zeros_like(probs)
-                one_hot[np.arange(m), mb_actions] = 1.0
-                coef = -(use_grad * ratio * mb_adv) / m         # (m,) 每筆係數
-                grad_logits = coef.reshape(-1, 1) * (one_hot - probs)
-                self.actor.backward(grad_logits, self.actor_lr)
+                # L^CLIP = min(surr1, surr2)，最大化它 → loss 取負。
+                # 「被 clip 那側、ratio 飽和則不更新」的梯度遮罩，
+                # 由 torch.min + torch.clamp 的次梯度自動完成（手刻版的 use_grad）。
+                actor_loss = -torch.min(surr1, surr2).mean()
+                self.actor_opt.zero_grad()
+                actor_loss.backward()
+                self.actor_opt.step()
 
                 # ── 更新 Critic：value MSE（target 已凍結）──────
-                v = self.critic.forward(mb_states)              # (m,)
-                grad_v = (v - mb_target) / m
-                self.critic.backward(grad_v, self.critic_lr)
+                v = self.critic(mb_states)                           # (m,)
+                critic_loss = F.mse_loss(v, mb_target)
+                self.critic_opt.zero_grad()
+                critic_loss.backward()
+                self.critic_opt.step()
 
         # 清空 buffer
         self._states      = []
@@ -184,7 +198,7 @@ def train():
     scores         = []
 
     print("=" * 60)
-    print("  RL Hello World 5 — PPO (PPO-Clip)")
+    print("  RL Hello World 5 — PPO (PPO-Clip) [PyTorch]")
     print("=" * 60)
     print(f"\nclip ε = {agent.clip_eps}   K_epochs = {agent.k_epochs}   "
           f"minibatch = {agent.minibatch_sz}")
