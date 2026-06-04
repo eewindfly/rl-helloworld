@@ -39,9 +39,24 @@ RL Hello World 4b — Actor-Critic (A2C) TD 版 on CartPole
        Critic loss = MSE(V(s), TD target)
   4. 更新時機不變：仍是 episode 結束後 batch 更新
      （也可改成每步更新，但 batch 較穩定、方便對比）
+
+────────────────────────────────────────────────────────────
+【關於這版：從 numpy 手刻 → PyTorch】
+
+  和 MC 版一樣，只有梯度實作換成 autograd。TD 版另有一個 PyTorch
+  要特別小心的點：
+
+    bootstrap 的 V(s') 是「目標」，不能對它回傳梯度，否則 critic 會
+    去優化「讓自己的預測等於自己」這種退化目標。所以 td_target 整段
+    用 with torch.no_grad() 算、再 detach。V(s)（被訓練的那個）才留梯度。
+
+  （手刻 numpy 版沒這個坑，因為它本來就只對 V(s) 那一路寫了 backward。）
 """
 
 import numpy as np
+import torch
+import torch.nn.functional as F
+from torch.distributions import Categorical
 import gymnasium as gym
 from utils import demo
 from pg_cartpole import PolicyNetwork as ActorNetwork
@@ -57,19 +72,15 @@ class ACTDAgent:
         self.actor  = ActorNetwork()
         self.critic = CriticNetwork()
 
-        self.gamma     = 0.99
-        # ⚠️ 和 MC 版唯一要動的東西：學習率必須重調，不能照抄 MC 版！
-        #   公式（advantage、critic target）完全照教科書，沒有任何額外技巧。
-        #   詳細原因見下方 update() 的長註解；這裡先講結論：
-        #   - actor_lr 調大（0.0005 → 0.02，約 40x）：
-        #       TD 的 δ「單筆數值」比 MC 的 (G_t - V) 小很多（見下方說明），
-        #       SGD 每步更新 ≈ lr × advantage，advantage 小了就要把 lr 放大補回來，
-        #       否則 actor 幾乎不動。
-        #   - critic_lr 調大（0.001 → 0.05）：
-        #       TD 是 bootstrap，advantage 完全靠 critic 算，critic 要夠準才有意義，
-        #       必須讓 V(s) 快點學起來。
-        self.actor_lr  = 0.02
-        self.critic_lr = 0.05
+        self.gamma = 0.99
+        # ⚠️ 學習率仍要比 MC 版動一下（原因見下方 update() 長註解）：
+        #   critic 要學快一點，TD 完全靠 critic 算 advantage，critic 不準
+        #   δ 連符號都不對。actor 則維持小步，配合 K 後面 PPO 的延續。
+        self.actor_lr  = 0.001
+        self.critic_lr = 0.005
+
+        self.actor_opt  = torch.optim.Adam(self.actor.parameters(),  lr=self.actor_lr)
+        self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=self.critic_lr)
 
         # 比 MC 版多存 next_state、terminated、done
         #   terminated：桿子真的倒了 → 真終止，V(s')=0
@@ -96,17 +107,15 @@ class ACTDAgent:
         self._dones.append(done)
 
     def update(self):
-        states      = np.array(self._states)       # (T, 4)
-        actions     = np.array(self._actions)      # (T,)
-        rewards     = np.array(self._rewards)      # (T,)
-        next_states = np.array(self._next_states)  # (T, 4)
-        terminateds = np.array(self._terminateds)  # (T,) bool 真終止
-        dones       = np.array(self._dones)        # (T,) bool episode 結束
+        states      = torch.as_tensor(np.array(self._states),      dtype=torch.float32)  # (T,4)
+        actions     = torch.as_tensor(np.array(self._actions),     dtype=torch.long)     # (T,)
+        rewards     = torch.as_tensor(np.array(self._rewards),     dtype=torch.float32)  # (T,)
+        next_states = torch.as_tensor(np.array(self._next_states), dtype=torch.float32)  # (T,4)
+        terminateds = torch.as_tensor(np.array(self._terminateds), dtype=torch.bool)     # (T,)
 
-        T = len(rewards)
-        N = int(dones.sum())   # 完整軌跡數（和 MC 版的 N 語意相同）
+        N = int(np.sum(self._dones))   # 完整軌跡數（和 MC 版的 N 語意相同）
 
-        # ── 步驟 1：算 TD target ──────────────────────────────
+        # ── 步驟 1：算 TD target（這是「目標」，不回傳梯度 → no_grad）──
         #
         #   TD target = r + γ × V(s')
         #
@@ -116,83 +125,65 @@ class ACTDAgent:
         #        必須照常用 V(s') bootstrap。若也歸零，等於告訴 critic
         #        「撐到滿分的狀態價值是 0」，反而懲罰最好的軌跡 → 造成回檔。
         #
-        next_values = self.critic.forward(next_states)   # (T,)
-        next_values[terminateds] = 0.0                   # 只有真終止才歸零
-        td_targets = rewards + self.gamma * next_values  # (T,)
+        with torch.no_grad():
+            next_values = self.critic(next_states)           # (T,)
+            next_values[terminateds] = 0.0                   # 只有真終止才歸零
+            td_targets = rewards + self.gamma * next_values  # (T,)
 
-        # ── 步驟 2：Critic 估 V(s) ───────────────────────────
-        values = self.critic.forward(states)             # (T,)
+        # ── 步驟 2：Critic 估 V(s)（這個要留梯度，critic 要學它）──
+        values = self.critic(states)                         # (T,)
 
         # ── 步驟 3：TD Advantage（= TD error δ）──────────────
         #
-        #   δ_t = r_t + γ V(s') - V(s)
-        #       = TD target - V(s)
+        #   δ_t = r_t + γ V(s') - V(s) = TD target - V(s)
+        #   對比 MC：Advantage = G_t - V(s)，只是把 G_t 換成 TD target。
+        #   .detach()：advantage 只當 Actor 權重，不讓梯度流回 Critic。
         #
-        #   對比 MC：Advantage = G_t - V(s)
-        #   只是把 G_t 換成 TD target，其餘完全相同。
-        #
-        advantage = td_targets - values   # (T,)
+        advantage = (td_targets - values).detach()           # (T,)
 
-        # ── 步驟 4：更新 Critic ──────────────────────────────
-        #   讓 V(s) → TD target（而非 MC 版的 G_t）
-        #   Loss = MSE(V(s), TD target)
-        grad_v = (values - td_targets) / T
-        self.critic.backward(grad_v, self.critic_lr)
+        # ── 步驟 4：更新 Critic（讓 V(s) → TD target，MSE）──
+        critic_loss = F.mse_loss(values, td_targets)
+        self.critic_opt.zero_grad()
+        critic_loss.backward()
+        self.critic_opt.step()
 
-        # ── 步驟 5：更新 Actor ───────────────────────────────
-        #   和 MC 版完全相同，只是 advantage 換成 TD error δ。
-        #   公式純教科書，沒有 normalize、沒有任何額外技巧。
+        # ── 步驟 5：更新 Actor（和 MC 版完全相同，只是 advantage 換成 δ）──
         #
         # ══════════════════════════════════════════════════════════════════
-        #  ⚠️ 為何「公式一樣」，照抄 MC 版的 lr 卻學不起來？
+        #  ⚠️ 公式和 MC 版一字不差，為什麼 TD 版還是比較難調、容易抖？
         # ══════════════════════════════════════════════════════════════════
-        #
-        #  先講一個容易誤會的點：
         #
         #    MC advantage：A = G_t          - V(s)
         #    TD advantage：δ = r + γV(s')   - V(s)
         #
-        #  兩者「期望值其實一樣」！因為
-        #       E[G_t | s,a] = E[r + γV(s') | s,a] = Q(s,a)
-        #    ⇒ 兩個 advantage 的期望都是同一個真實 advantage  A(s,a)=Q(s,a)-V(s)。
-        #  而 CartPole 的真實 advantage 本來就很小（換個動作對未來影響不大）。
-        #  所以「理論上不該差太多」這個直覺是對的——指的是期望。
+        #  兩者「期望值其實一樣」（E[G_t]=E[r+γV(s')]=Q(s,a)），CartPole 的
+        #  真實 advantage 本來就很小。差別在「單筆樣本」與「初期方向」：
         #
-        #  真正差很多的是「單筆樣本的大小」，也就是 variance：
-        #    - MC 的 G_t 是整段未來的隨機和 → 單筆會劇烈擺盪到 ±幾十（高 variance）。
-        #    - TD 的 δ 只看一步           → 單筆穩穩落在 ~1（低 variance）。
-        #  SGD 每步乘的是「這個有雜訊的單筆估計」、不是期望，
-        #  所以 MC 單筆大 → 小 lr 就夠；TD 單筆小 → 要把 lr 放大才補得回來。
+        #  1. 初期 critic 還沒學好（V≈0）時，兩者行為天差地遠：
+        #       MC ≈ G_t - 0 = G_t：仍帶真實 return 的資訊（mean 幾十），
+        #                           就算 critic 沒用也學得動（退化成 REINFORCE）。
+        #       TD ≈ r + 0 - 0 = r ≈ +1：CartPole 每步（含倒下那步）reward 都是
+        #                           +1，於是「每一步」advantage 都 ≈ +1，連失敗那步
+        #                           都是正的 → actor 被告知「每個動作都好」，沒方向。
+        #     ⇒ 所以 critic 一定要先學準，δ 的符號才有意義（倒下那步的 δ 變大負值
+        #        來懲罰）。這就是 critic_lr 要調大的原因。
         #
-        #  還有一個關鍵，解釋為什麼 TD 不只是「訊號小」而是初期根本沒方向：
-        #  上面「期望相同」只在 critic 準時才成立。訓練初期 V(s) ≈ 0：
-        #    - MC ≈ G_t - 0 = G_t：仍帶著真實 return 的資訊（mean ≈ 真實價值，幾十），
-        #                          就算 critic 沒用也學得動（本質退化成 REINFORCE）。
-        #    - TD ≈ r + 0 - 0 = r ≈ +1：真實資訊全丟了，而且 CartPole 每一步
-        #                          （含倒下那步）reward 都是 +1，於是「每一步」的
-        #                          advantage 都 ≈ +1，連失敗那步都是正的
-        #                          → actor 被告知「每個動作都很好」，完全沒方向
-        #                          （原 lr 實測 avg 卡在 ~13）。
+        #  2. bootstrap 帶 bias：δ 用 V(s') 估未來，V 不準 → 梯度方向偏；
+        #     policy 一變 V 就過時，advantage 跟著退化 → 偶爾回檔。
+        #     MC 的 G_t 是無 bias 的真實 return，沒這問題。
         #
-        #  小結，兩件事疊加：
-        #    1. critic_lr 調大：讓 V(s) 快點學準。critic 一準，δ 的符號才會對
-        #       （倒下那步的 δ 會變成大負值來懲罰），TD 才開始有意義。
-        #    2. actor_lr 調大：δ 單筆量級小，要放大 lr 才有足夠的更新力道。
-        #
-        #  代價：訓練會比 MC 版抖（偶爾回檔），原因有二：
-        #    (a) bootstrap 帶來 bias——δ 用 V(s') 估未來，V 不準時梯度方向會偏；
-        #        policy 一變 V 就過時，advantage 跟著退化而回檔。
-        #        MC 的 G_t 是無 bias 的真實 return，沒這問題。
-        #    (b) δ 動態範圍大——倒下那步 δ≈-35、其他步≈1，偶爾來一發大梯度就會晃。
-        #  這正是 TD 高 bias 的真實樣子
-        #  ——對應本檔開頭與 actor_critic.py docstring 的 MC vs TD 對照表。
+        #  （補充：手刻純 SGD 版還要額外把 actor_lr 放大約 40x，因為 δ 單筆量級
+        #    比 MC 的 G_t 小很多、SGD 每步 ≈ lr×δ；改用 Adam 後，Adam 會對梯度
+        #    做 RMS 正規化，量級差異大半被吸收，所以這版 lr 不必放那麼誇張——
+        #    但上面 1、2 兩點是演算法本質，跟用不用 Adam 無關，依然成立。）
         # ══════════════════════════════════════════════════════════════════
-        probs = self.actor.forward(states)          # (T, 2)
-        one_hot = np.zeros_like(probs)
-        one_hot[np.arange(T), actions] = 1.0
-        grad_logits = -(one_hot - probs) * advantage.reshape(-1, 1)
-        grad_logits /= N    # 除以軌跡數（和 MC 版相同）
-        self.actor.backward(grad_logits, self.actor_lr)
+        logits    = self.actor(states)            # (T, 2)
+        dist      = Categorical(logits=logits)
+        log_probs = dist.log_prob(actions)        # (T,)
+        actor_loss = -(log_probs * advantage).sum() / N
+        self.actor_opt.zero_grad()
+        actor_loss.backward()
+        self.actor_opt.step()
 
         # 清空
         self._states      = []
@@ -217,7 +208,7 @@ def train():
     scores         = []
 
     print("=" * 60)
-    print("  RL Hello World 4b — Actor-Critic (A2C) TD 版")
+    print("  RL Hello World 4b — Actor-Critic (A2C) TD 版 [PyTorch]")
     print("=" * 60)
     print("\nTD Advantage：δ = r + γV(s') - V(s)")
     print("對比 MC    ：A = G_t - V(s)")
