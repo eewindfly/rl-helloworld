@@ -180,7 +180,7 @@ class ACTDAgent:
         logits    = self.actor(states)            # (T, 2)
         dist      = Categorical(logits=logits)
         log_probs = dist.log_prob(actions)        # (T,)
-        actor_loss = -(log_probs * advantage).mean()
+        actor_loss = -(log_probs * advantage).sum() / N
         self.actor_opt.zero_grad()
         actor_loss.backward()
         self.actor_opt.step()
