@@ -27,27 +27,28 @@ RL Hello World 5b — PPO 連續動作版 on Pendulum
     動作分布 Categorical(logits) → Normal(mean, std)
     Actor 輸出 logits(2) → mean(1) + 可學習 log_std；log_prob 對動作維度加總。
 
-  「為了讓較難的環境收斂」而加的工程處理（非核心、明示加入）：
-    a. advantage 正規化：每批把 advantage 標準化成 0 均值/單位方差。
-       Pendulum 的 reward 尺度大（百量級負值），不正規化梯度尺度會亂跳。
-       （CartPole dense +1、尺度小，5 版不需要，所以沒加。）
-    b. 更新次數 250 → 400：Pendulum 比 CartPole 難，要更多資料才收斂。
-    這兩項和 entropy bonus 同類——「標配但非核心」，CartPole 用不到、
-    Pendulum 用得到，故在此明示，不混進「連續動作」這個概念裡。
+  ★ 演算法與 ppo_cartpole.py「完全相同」：ratio、clip、GAE、critic、/N
+    正規化、lr、batch 全部一字不差。刻意**不加** advantage 正規化——前面
+    每個階段都沒加，加了就等於偷偷改了更新規則，破壞「只換分布」這句話。
+
+  唯一的鬆綁（且只動「訓練預算」、不動演算法）：
+    更新次數 250 → 600。Pendulum 比 CartPole 難（swing-up），純粹要更多
+    資料才收斂；這不改任何一行更新邏輯，和「多跑幾個 epoch」同性質。
+    （實測：no-norm 純 GAE 跑到 600 次更新就能解到 ≈ -250。）
 
 ────────────────────────────────────────────────────────────
 【λ 開關：一鍵看見「為什麼非 GAE 不可」（本階段最重要的實驗）】
 
   把 gae_lambda 從 0.95 改成 0.0 重跑——advantage 就退化回階段 4b 的
-  「單步 TD δ」。結果（實測）：
+  「單步 TD δ」。結果（實測，兩者都跑滿 600 次更新、其餘設定完全相同）：
 
-    gae_lambda = 0.95（GAE）  → return 從 ≈ -1500 一路爬到 ≈ -250（學會！）
-    gae_lambda = 0.0 （單步TD）→ return 卡在 ≈ -1300~-1500（隨機水準，學不起來）
+    gae_lambda = 0.95（GAE）  → return 從 ≈ -1500 一路爬到 ≈ -256（學會！）
+    gae_lambda = 0.0 （單步TD）→ return 卡在 ≈ -1365（隨機水準，學不起來）
 
-  ⚠️ 關鍵對照：上面這個「0.0 學不起來」是在 advantage 正規化照開、更新次數
-     照給 400 的條件下測的——也就是「其他全給齊，只把 GAE 關掉」。它依然失敗。
-     ⇒ 證明讓 Pendulum 能學的決定性因素是 GAE（λ>0 的多步信用分配），
-       不是正規化、也不是多跑幾次。這就是階段 4c 那根 λ 旋鈕的真正威力。
+  ⚠️ 關鍵對照：「其他全給齊（同樣 600 次更新、同樣沒有正規化），只把 GAE
+     關掉」，它就學不起來。
+     ⇒ 證明讓 Pendulum 能學的決定性因素就是 GAE（λ>0 的多步信用分配）。
+       這就是階段 4c 那根 λ 旋鈕的真正威力。
 
   （這也呼應歷史：真實 PPO 從 2017 原版就標配 GAE。階段 5 + 5b 合起來，
     才是「clip + GAE」這個完整、真實的 PPO。）
@@ -117,7 +118,7 @@ class GaussianActorNetwork(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────
-#  PPO Agent（與 ppo_cartpole.py 結構相同，僅分布相關處 + adv 正規化改動）
+#  PPO Agent（與 ppo_cartpole.py 演算法完全相同，僅分布相關處改動）
 # ─────────────────────────────────────────────────────────
 
 class PPOAgent:
@@ -209,12 +210,10 @@ class PPOAgent:
             deltas      = rewards + self.gamma * next_values - values  # (T,)  δ_t
 
             # (c) advantage = GAE（沿用 4c/5）；critic target = λ-return
+            #     ⚠️ 沒有 advantage 正規化——演算法與 ppo_cartpole.py 完全相同，
+            #        只換了動作分布。Pendulum 較難純粹靠「多跑幾次」解決（見 train）。
             advantages = self.compute_gae(deltas, self._dones)   # (T,)  Â_t^GAE
             returns    = advantages + values                     # (T,)  λ-return（critic target）
-
-            # (d) advantage 正規化（Pendulum 需要；CartPole 版沒有，見檔頭）
-            #     ⚠️ 只正規化「給 actor 的 advantage」，critic target(returns) 用原始尺度。
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         # ══════════════════════════════════════════════════════════
         #  Phase 2：同一批資料，重複做 K 次完整 update
@@ -258,7 +257,8 @@ def train():
     agent = PPOAgent(action_low, action_high)
 
     BATCH_EPISODES = 4     # 每收集 4 條軌跡才更新一次（與離散版相同）
-    NUM_UPDATES    = 400   # Pendulum 較難，比 CartPole(250) 多（明示的非核心調整）
+    NUM_UPDATES    = 600   # Pendulum 較難，比 CartPole(250) 多跑——唯一的鬆綁，
+                           # 純訓練預算、不改演算法（演算法與 ppo_cartpole.py 完全相同）
     EPISODES       = BATCH_EPISODES * NUM_UPDATES
     scores         = []
 
@@ -328,7 +328,8 @@ def train():
         ("Actor 輸出",   "logits(2)",                "mean(1) + log_std"),
         ("動作分布",     "Categorical(logits)",      "Normal(mean, std)"),
         ("PPO 主體",     "ratio+clip+GAE+K複用",     "完全相同（一行不改）"),
-        ("額外工程",     "無",                       "adv 正規化 + 更多更新"),
+        ("adv 正規化",   "無",                        "無（保持最小 diff）"),
+        ("更新次數",     "250",                       "600（純訓練預算，較難）"),
     ]
     print(f"  {'':12s} {'離散 PPO':28s} {'連續 PPO':28s}")
     print("  " + "-" * 70)
@@ -337,7 +338,7 @@ def train():
     print("\n核心洞見：")
     print("  1. PPO 的 ratio + clip 與動作分布無關——換成高斯，PPO 主體一行不改。")
     print("  2. swing-up 能學起來靠的是 GAE（λ=0.95）；把 λ 改 0（單步 TD），")
-    print("     就算 adv 正規化照開、更新照給，依然學不起來——GAE 才是關鍵。")
+    print("     其餘設定全給齊（一樣沒正規化、一樣跑 600 次），依然學不起來——GAE 才是關鍵。")
 
     return agent
 
