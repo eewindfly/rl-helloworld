@@ -250,8 +250,12 @@ def train():
     env   = gym.make("CartPole-v1")
     agent = PPOAgent()
 
-    BATCH_EPISODES = 8     # 每收集 8 條軌跡才更新一次（batch size，PPO 喜歡大一點的 batch）
-    NUM_UPDATES    = 125   # 總共要更新幾次（真正決定學不學得起來的量）
+    # ⚠️ 對齊 AC(TD)：batch=4、共 250 次更新、總計 1000 episodes，完全相同。
+    #    batch 大小是正交超參（AC 也能調大），非 PPO 核心，故對齊以保持最小 diff。
+    #    （PPO 實務上偏好更大的 batch 讓 IS 重複利用更穩，那是「標配但非核心」，
+    #      和 GAE/entropy 同一類，本檔一律不加。clip 已能讓小 batch 安全複用。）
+    BATCH_EPISODES = 4     # 每收集 4 條軌跡才更新一次（batch size，與 AC(TD) 相同）
+    NUM_UPDATES    = 250   # 總共要更新幾次（與 AC(TD) 相同，總環境互動量一致）
     EPISODES       = BATCH_EPISODES * NUM_UPDATES
     scores         = []
 
