@@ -25,9 +25,24 @@ RL Hello World 5 — PPO (PPO-Clip) on CartPole
      整個 K-epoch 過程中保持不變（PPO 標準做法）。
   3. 把 A2C 的目標  log π · A
      換成 PPO 的 clipped surrogate：
-        ratio      = π_new(a|s) / π_old(a|s)
+        ratio      = π_new(a|s) / π_old(a|s)        ← important sampling
         L^CLIP     = min( ratio · A,  clip(ratio, 1-ε, 1+ε) · A )
-  4. 外層多了「K 個 epoch × minibatch」迴圈，重複用同一批資料更新。
+  4. 外層多了「K 次 full-batch 更新」迴圈，重複用同一批資料更新。
+
+【為什麼這版「不切 minibatch」？（最小 diff 的精神）】
+
+  minibatch 不是 PPO 的核心，它只是 SGD 的工程細節（省記憶體、加梯度
+  噪聲），AC(TD) 一樣能切 minibatch。把它放進「PPO vs AC」的 diff 會
+  混淆兩件正交的事。PPO 相對 AC(TD) 真正且唯一必要的概念增量只有：
+
+    (i)  important sampling：資料用 π_old 收，要重複拿來更新 π_new，
+         就必須用 ratio = π_new/π_old 修正「採樣分布 ≠ 當前分布」的
+         偏差——這正是「同一批資料能反覆更新」的理論依據。
+    (ii) clip：純 IS 反覆更新會因 ratio 爆掉而發散；clip 把每步幅度
+         夾住，讓「重複利用」變安全。
+
+  因此本版採「最小 diff」：整批資料、做 K 次完整 update，不切 minibatch。
+  （若想加 minibatch 純粹是優化技巧，與上面兩點無關。）
 
 【clip 在做什麼？（PPO 的靈魂）】
 
@@ -115,9 +130,8 @@ class PPOAgent:
         self.critic_opt = torch.optim.Adam(self.critic.parameters(), lr=self.critic_lr)
 
         # ── PPO 核心超參 ──
-        self.clip_eps     = 0.2   # ε：ratio 被夾在 [1-ε, 1+ε]
-        self.k_epochs     = 4     # 同一批資料重複更新幾個 epoch
-        self.minibatch_sz = 64    # 每個 minibatch 的 transition 數
+        self.clip_eps = 0.2   # ε：ratio 被夾在 [1-ε, 1+ε]
+        self.k_epochs = 4     # 同一批資料整批重複更新幾次（full-batch，不切 minibatch）
 
         # buffer：和 actor_critic_td.py 完全相同
         #   （PPO 不用額外存 old_log_prob —— 在 update() 開頭，
@@ -172,46 +186,43 @@ class PPOAgent:
             advantages = td_targets - old_values                     # (T,)  Â_t
 
         # ══════════════════════════════════════════════════════════
-        #  Phase 2：同一批資料，跑 K 個 epoch，每 epoch 切 minibatch
+        #  Phase 2：同一批資料（整批），重複做 K 次完整 update
+        #           ── 這就是「AC(TD) + IS + clip」的最小 diff：
+        #              和 AC(TD) 唯一的差別是 (1) 目標換成 clipped
+        #              surrogate、(2) 同批資料更新 K 次而非 1 次。
+        #              不切 minibatch（那是正交的優化技巧）。
         # ══════════════════════════════════════════════════════════
         for _ in range(self.k_epochs):
-            idx = torch.randperm(T)               # 每個 epoch 重新洗牌
-            for start in range(0, T, self.minibatch_sz):
-                mb = idx[start:start + self.minibatch_sz]
-                mb_states  = states[mb]
-                mb_actions = actions[mb]
-                mb_adv     = advantages[mb]
-                mb_oldlogp = old_log_probs[mb]
-                mb_target  = td_targets[mb]
+            # ── 更新 Actor：clipped surrogate（整批）──────────
+            # 公式：log π_θ(a_t | s_t)  ← ratio 的分子（用「當前」θ 算）
+            logits   = self.actor(states)                            # (T, 2)
+            new_logp = Categorical(logits=logits).log_prob(actions)  # (T,)
 
-                # ── 更新 Actor：clipped surrogate ──────────────
-                # 公式：log π_θ(a_t | s_t)  ← ratio 的分子（用「當前」θ 算）
-                logits   = self.actor(mb_states)                     # (m, 2)
-                new_logp = Categorical(logits=logits).log_prob(mb_actions)  # (m,)
+            # 公式 (1)：r_t(θ) = exp( log π_θ − log π_θ_old )
+            #   AC(TD) 用的是 log π_θ 本身；PPO 改用「比值」做 important
+            #   sampling，才能合法地拿 π_old 收的資料反覆更新 π_new。
+            ratio = torch.exp(new_logp - old_log_probs)              # r_t(θ) = π_new/π_old
+            # 公式 (4) 兩項：surr1 = r_t·Â_t ，surr2 = clip(r_t,1−ε,1+ε)·Â_t
+            surr1 = ratio * advantages                               # r_t(θ)·Â_t
+            surr2 = torch.clamp(ratio, 1 - self.clip_eps,
+                                       1 + self.clip_eps) * advantages  # clip(r_t,1−ε,1+ε)·Â_t
 
-                # 公式 (1)：r_t(θ) = exp( log π_θ − log π_θ_old )
-                ratio = torch.exp(new_logp - mb_oldlogp)             # r_t(θ) = π_new/π_old
-                # 公式 (4) 兩項：surr1 = r_t·Â_t ，surr2 = clip(r_t,1−ε,1+ε)·Â_t
-                surr1 = ratio * mb_adv                               # r_t(θ)·Â_t
-                surr2 = torch.clamp(ratio, 1 - self.clip_eps,
-                                           1 + self.clip_eps) * mb_adv  # clip(r_t,1−ε,1+ε)·Â_t
+            # 公式 (4)：L^CLIP = E[ min(surr1, surr2) ]，最大化它 → loss 取負。
+            #   actor_loss = −L^CLIP
+            # 「被 clip 那側、ratio 飽和則不更新」的梯度遮罩，
+            # 由 torch.min + torch.clamp 的次梯度自動完成（手刻版的 use_grad）。
+            actor_loss = -torch.min(surr1, surr2).mean()            # −L^CLIP(θ)
+            self.actor_opt.zero_grad()
+            actor_loss.backward()
+            self.actor_opt.step()
 
-                # 公式 (4)：L^CLIP = E[ min(surr1, surr2) ]，最大化它 → loss 取負。
-                #   actor_loss = −L^CLIP
-                # 「被 clip 那側、ratio 飽和則不更新」的梯度遮罩，
-                # 由 torch.min + torch.clamp 的次梯度自動完成（手刻版的 use_grad）。
-                actor_loss = -torch.min(surr1, surr2).mean()        # −L^CLIP(θ)
-                self.actor_opt.zero_grad()
-                actor_loss.backward()
-                self.actor_opt.step()
-
-                # ── 更新 Critic：value MSE（target 已凍結）──────
-                # 公式 (5)：L^VF(φ) = E[ ( V_φ(s_t) − y_t )² ]
-                v = self.critic(mb_states)                           # (m,)  V_φ(s_t)
-                critic_loss = F.mse_loss(v, mb_target)              # (V_φ(s_t) − y_t)²
-                self.critic_opt.zero_grad()
-                critic_loss.backward()
-                self.critic_opt.step()
+            # ── 更新 Critic：value MSE（target 已凍結，整批）──
+            # 公式 (5)：L^VF(φ) = E[ ( V_φ(s_t) − y_t )² ]
+            v = self.critic(states)                                  # (T,)  V_φ(s_t)
+            critic_loss = F.mse_loss(v, td_targets)                 # (V_φ(s_t) − y_t)²
+            self.critic_opt.zero_grad()
+            critic_loss.backward()
+            self.critic_opt.step()
 
         # 清空 buffer
         self._states      = []
@@ -239,8 +250,8 @@ def train():
     print("  RL Hello World 5 — PPO (PPO-Clip) [PyTorch]")
     print("=" * 60)
     print(f"\nclip ε = {agent.clip_eps}   K_epochs = {agent.k_epochs}   "
-          f"minibatch = {agent.minibatch_sz}")
-    print("核心   ：ratio + clip + 同批多 epoch 複用")
+          f"(full-batch，不切 minibatch)")
+    print("核心   ：ratio(important sampling) + clip + 同批 K 次複用")
     print("advantage：單步 TD δ（沿用 A2C-TD，不用 GAE）")
     print("目標   ：近 50 回合平均分 ≥ 195 = 解決！")
     print(f"\n開始訓練 {EPISODES} 個 episodes...\n")
