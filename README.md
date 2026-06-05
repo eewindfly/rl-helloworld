@@ -49,6 +49,9 @@ Q-table 直接存每個 (s, a) 的預期獎勵。
 **Q-table vs DQN 的本質差異：**
 只有一個：把 `Q[s][a]` 查表換成 `network(s)[a]` 計算。
 
+> 這也是整個系列從 **numpy → PyTorch** 的切換點：階段 1 沒有神經網路，
+> 用 numpy 最清楚；這裡開始有了網路，交給 PyTorch 的 autograd 與 Adam。
+
 ---
 
 ### ✅ 階段 3 — Policy Gradient on CartPole
@@ -198,12 +201,16 @@ PPO 長期是 RLHF 的標準引擎——在經典流程裡，reward model 訓練
 
 ## 環境設定
 
-只依賴 `numpy` 和 `gymnasium`，神經網路全部用純 numpy 手刻，不需要 PyTorch / TensorFlow。
+依賴 `gymnasium`、`numpy`、`torch`。
+階段 1 只用到 numpy（Q-table）；階段 2 起的神經網路用 PyTorch。
 
 ```bash
 pip install -r requirements.txt
-# 或手動： pip install "gymnasium[classic-control]" numpy
+# 或手動： pip install "gymnasium[classic-control]" numpy torch
 ```
+
+> CartPole 的網路很小，CPU 就跑得動，安裝 CPU 版 torch 即可：
+> `pip install torch --index-url https://download.pytorch.org/whl/cpu`
 
 執行範例：
 

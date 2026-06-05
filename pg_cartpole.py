@@ -111,7 +111,10 @@ class PolicyNetwork(nn.Module):
         """單筆推論：numpy 狀態 → numpy 動作機率（給 choose_action / demo 用）"""
         x = torch.as_tensor(state, dtype=torch.float32).unsqueeze(0)
         logits = self.forward(x)
-        return torch.softmax(logits, dim=-1)[0].numpy()
+        # 轉 float64 並重新正規化：float32 的 softmax 加總可能差 1e-7，
+        # 會讓 np.random.choice(p=...) 因「機率和不等於 1」報錯。
+        probs = torch.softmax(logits, dim=-1)[0].double().numpy()
+        return probs / probs.sum()
 
 
 # ─────────────────────────────────────────────────────────
