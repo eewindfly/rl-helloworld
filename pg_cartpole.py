@@ -229,21 +229,27 @@ class PGAgent:
         actions = torch.as_tensor(np.array(all_actions), dtype=torch.long)
         returns = torch.as_tensor(np.array(all_returns), dtype=torch.float32)
 
-        # N 條軌跡合併後統一 normalize，保留跨 episode 的相對差異
-        # 注意：用全局 mean 當 baseline 有已知的系統性問題——
-        #   G_t 天然隨時間遞減（後面步數少，累積獎勵小），
-        #   導致後期動作相對 mean 偏低，被系統性懲罰，
-        #   即使整條軌跡走得好也一樣。
-        # 正確做法是用 V(s) 當 baseline（Advantage = G_t - V(s)），
-        # 針對每個狀態估出合理期望，這就是 Actor-Critic 要解決的問題。
-        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+        # REINFORCE with baseline：減掉一個常數 baseline b（這裡用整批 G_t 的平均）。
+        #   ∇J = (1/N) Σ_n Σ_t ∇logπ(a_t|s_t) × (G_t − b)
+        # 教科書允許任何「與動作無關」的 baseline，期望值不變、方差更小。
+        #
+        # ⚠️ 刻意「只減 mean、不除以 std」：÷std 是工程上的標準化，不在公式裡，
+        #    而且會逐次改變梯度尺度。保留原始尺度最貼公式。
+        #
+        # 注意：用單一全局 mean 當 baseline 有已知的系統性問題——
+        #   G_t 天然隨時間遞減（後面步數少，累積獎勵小），後期動作相對 mean
+        #   偏低被系統性懲罰，即使整條軌跡走得好也一樣。
+        # 更好的做法是用 V(s) 當「逐狀態」baseline（Advantage = G_t − V(s)），
+        # 這正是階段 4 Actor-Critic 要解決的問題。
+        baseline = returns.mean()
+        returns  = returns - baseline
 
         # 前向 → 機率分佈 → 取出實際動作的 log π(a|s)
         logits    = self.policy_net(states)             # (T, 2)
         dist      = Categorical(logits=logits)
         log_probs = dist.log_prob(actions)              # (T,)
 
-        # Loss = -(1/N) Σ_n Σ_t log π(a_t|s_t) × G_t，對應公式的 1/N。
+        # Loss = -(1/N) Σ_n Σ_t log π(a_t|s_t) × (G_t − b)，對應公式的 1/N。
         # .mean() 會除以總 timestep 數 T（= N × avg_episode_len），
         # 和公式的 /N 相差一個 avg_episode_len，所以用 .sum() / N。
         loss = -(log_probs * returns).sum() / N
@@ -346,7 +352,7 @@ def train():
         ("訓練時機",   "每一步",                "Episode 結束後"),
         ("資料重用",   "Replay buffer（可重用）","On-policy（跑完就丟）"),
         ("Return",     "Bellman（一步 TD）",     "Monte Carlo（整段）"),
-        ("方差",       "低",                    "高（需 normalize）"),
+        ("方差",       "低",                    "高（需 baseline）"),
     ]
     print(f"  {'':14s} {'DQN':24s} {'Policy Gradient':24s}")
     print("  " + "-" * 64)

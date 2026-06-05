@@ -116,8 +116,12 @@ class QNetwork(nn.Module):
 
 class ReplayBuffer:
     """
-    儲存過去的經驗 (s, a, r, s', done)
+    儲存過去的經驗 (s, a, r, s', terminated)
     訓練時隨機抽 batch，打破時間相關性
+
+    ⚠️ 第 5 格存的是 terminated（桿子真的倒了），不是 done。
+       truncated（撐到 500 步上限被截斷）不算終止，s' 仍有未來價值，
+       target 要照常 bootstrap。和 actor_critic_td / ppo 的處理一致。
 
     為什麼要打破相關性？
       連續幾步的狀態很相似（t 時刻的狀態跟 t+1 幾乎一樣）
@@ -127,14 +131,14 @@ class ReplayBuffer:
     def __init__(self, capacity=10000):
         self.buffer = deque(maxlen=capacity)
 
-    def push(self, state, action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
+    def push(self, state, action, reward, next_state, terminated):
+        self.buffer.append((state, action, reward, next_state, terminated))
 
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
+        states, actions, rewards, next_states, terminateds = zip(*batch)
         return (np.array(states), np.array(actions),
-                np.array(rewards), np.array(next_states), np.array(dones))
+                np.array(rewards), np.array(next_states), np.array(terminateds))
 
     def __len__(self):
         return len(self.buffer)
@@ -175,14 +179,14 @@ class DQNAgent:
         if len(self.replay_buffer) < self.batch_size:
             return None   # buffer 還不夠，先跳過
 
-        states, actions, rewards, next_states, dones = \
+        states, actions, rewards, next_states, terminateds = \
             self.replay_buffer.sample(self.batch_size)
 
         states      = torch.as_tensor(states,      dtype=torch.float32)
         actions     = torch.as_tensor(actions,     dtype=torch.long)
         rewards     = torch.as_tensor(rewards,     dtype=torch.float32)
         next_states = torch.as_tensor(next_states, dtype=torch.float32)
-        dones       = torch.as_tensor(dones,       dtype=torch.float32)
+        terminateds = torch.as_tensor(terminateds, dtype=torch.float32)
 
         # 目前的 Q(s, a)：先算所有動作的 Q，再用 gather 取「實際執行的那個動作」
         #   gather 取代手刻版「q_target[arange, actions] = targets，其餘相減為 0」
@@ -190,13 +194,16 @@ class DQNAgent:
         q_values = self.main_net(states)                          # (batch, 2)
         q_sa     = q_values.gather(1, actions.unsqueeze(1)).squeeze(1)  # (batch,)
 
-        # Bellman target = r + γ · max Q(s', a')（終止狀態只有 r）
+        # Bellman target = r + γ · max Q(s', a')
+        #   ⚠️ 只有 terminated（真終止）才把未來歸零，用 (1 - terminated)。
+        #      truncated（撐到上限被截斷）桿子還立著，s' 仍有未來價值，
+        #      照常 bootstrap——和 actor_critic_td / ppo 一致。
         #   用 no_grad 包住：target 是「固定目標」，不該對它回傳梯度。
         #   （手刻版是靠 target_net 不參與 backward 隱含做到這件事。）
         with torch.no_grad():
             next_q     = self.target_net(next_states)            # (batch, 2)
             max_next_q = next_q.max(dim=1).values                # (batch,)
-            targets    = rewards + self.gamma * max_next_q * (1 - dones)
+            targets    = rewards + self.gamma * max_next_q * (1 - terminateds)
 
         # MSE loss + 自動反向傳播 + 自動更新
         loss = F.mse_loss(q_sa, targets)
@@ -241,10 +248,11 @@ def train():
         while True:
             action = agent.choose_action(state)
             next_state, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
+            done = terminated or truncated   # 只用來結束這個 episode 的迴圈
 
-            # 存入 replay buffer
-            agent.replay_buffer.push(state, action, reward, next_state, float(done))
+            # 存入 replay buffer：第 5 格存 terminated（不是 done）。
+            # 截斷 truncated 不算終止，target 要照常 bootstrap（見 train()）。
+            agent.replay_buffer.push(state, action, reward, next_state, float(terminated))
 
             # 訓練
             loss = agent.train()
