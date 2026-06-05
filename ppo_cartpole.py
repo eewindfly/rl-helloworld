@@ -56,6 +56,36 @@ RL Hello World 5 — PPO (PPO-Clip) on CartPole
   其實就是這個次梯度，現在交給 autograd。
 """
 
+# ════════════════════════════════════════════════════════════
+# 【PPO 核心公式速查表（對照 update() 內的程式碼）】
+#
+#   符號：θ = 新策略參數、θ_old = 收資料時凍結的舊策略、
+#         ε = clip 幅度、γ = 折扣因子、V = critic（價值函數）。
+#
+#   (1) 機率比 ratio
+#         r_t(θ) = π_θ(a_t|s_t) / π_θ_old(a_t|s_t)
+#                = exp( log π_θ(a_t|s_t) − log π_θ_old(a_t|s_t) )
+#       → 程式：ratio = exp(new_logp − old_logp)
+#
+#   (2) TD target（價值學習目標）
+#         y_t = r_t + γ·V(s_{t+1})        （終止時 V(s_{t+1}) = 0）
+#       → 程式：td_targets = rewards + γ * next_values
+#
+#   (3) Advantage（單步 TD 殘差 δ，本檔不用 GAE）
+#         Â_t = δ_t = r_t + γV(s_{t+1}) − V(s_t) = y_t − V(s_t)
+#       → 程式：advantages = td_targets − old_values
+#
+#   (4) Clipped surrogate（PPO 的靈魂，Actor 目標）
+#         L^CLIP(θ) = E_t[ min( r_t(θ)·Â_t,
+#                               clip(r_t(θ), 1−ε, 1+ε)·Â_t ) ]
+#       Actor loss = −L^CLIP（目標要最大化 → 取負做梯度下降）
+#       → 程式：actor_loss = −min(surr1, surr2).mean()
+#
+#   (5) Value loss（Critic 目標，MSE）
+#         L^VF(φ) = E_t[ ( V_φ(s_t) − y_t )² ]
+#       → 程式：critic_loss = mse_loss(v, td_targets)
+# ════════════════════════════════════════════════════════════
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -125,18 +155,21 @@ class PPOAgent:
         # ══════════════════════════════════════════════════════════
         with torch.no_grad():
             # (a) old_log_prob = log π_old(a|s)：此刻的 actor 就是 π_old
+            #     公式：log π_θ_old(a_t | s_t)         ← 之後算 ratio 的分母
             old_logits    = self.actor(states)                       # (T, 2)
             old_log_probs = Categorical(logits=old_logits).log_prob(actions)  # (T,)
 
             # (b) TD target = r + γV(s')，只有真終止才把 V(s') 歸零
             #     （truncated 照常 bootstrap —— 和 TD 版完全相同的處理）
-            next_values = self.critic(next_states)                   # (T,)
+            #     公式 (2)：y_t = r_t + γ·V(s_{t+1})，  終止時 V(s_{t+1})=0
+            next_values = self.critic(next_states)                   # (T,)  V(s_{t+1})
             next_values[terminateds] = 0.0
-            td_targets = rewards + self.gamma * next_values          # (T,)
+            td_targets = rewards + self.gamma * next_values          # (T,)  y_t
 
             # (c) advantage = TD target - V_old(s)，單步 TD δ（不用 GAE）
-            old_values = self.critic(states)                         # (T,)
-            advantages = td_targets - old_values                     # (T,)
+            #     公式 (3)：Â_t = δ_t = y_t − V(s_t)
+            old_values = self.critic(states)                         # (T,)  V(s_t)
+            advantages = td_targets - old_values                     # (T,)  Â_t
 
         # ══════════════════════════════════════════════════════════
         #  Phase 2：同一批資料，跑 K 個 epoch，每 epoch 切 minibatch
@@ -152,25 +185,30 @@ class PPOAgent:
                 mb_target  = td_targets[mb]
 
                 # ── 更新 Actor：clipped surrogate ──────────────
+                # 公式：log π_θ(a_t | s_t)  ← ratio 的分子（用「當前」θ 算）
                 logits   = self.actor(mb_states)                     # (m, 2)
                 new_logp = Categorical(logits=logits).log_prob(mb_actions)  # (m,)
 
-                ratio = torch.exp(new_logp - mb_oldlogp)             # π_new / π_old
-                surr1 = ratio * mb_adv
+                # 公式 (1)：r_t(θ) = exp( log π_θ − log π_θ_old )
+                ratio = torch.exp(new_logp - mb_oldlogp)             # r_t(θ) = π_new/π_old
+                # 公式 (4) 兩項：surr1 = r_t·Â_t ，surr2 = clip(r_t,1−ε,1+ε)·Â_t
+                surr1 = ratio * mb_adv                               # r_t(θ)·Â_t
                 surr2 = torch.clamp(ratio, 1 - self.clip_eps,
-                                           1 + self.clip_eps) * mb_adv
+                                           1 + self.clip_eps) * mb_adv  # clip(r_t,1−ε,1+ε)·Â_t
 
-                # L^CLIP = min(surr1, surr2)，最大化它 → loss 取負。
+                # 公式 (4)：L^CLIP = E[ min(surr1, surr2) ]，最大化它 → loss 取負。
+                #   actor_loss = −L^CLIP
                 # 「被 clip 那側、ratio 飽和則不更新」的梯度遮罩，
                 # 由 torch.min + torch.clamp 的次梯度自動完成（手刻版的 use_grad）。
-                actor_loss = -torch.min(surr1, surr2).mean()
+                actor_loss = -torch.min(surr1, surr2).mean()        # −L^CLIP(θ)
                 self.actor_opt.zero_grad()
                 actor_loss.backward()
                 self.actor_opt.step()
 
                 # ── 更新 Critic：value MSE（target 已凍結）──────
-                v = self.critic(mb_states)                           # (m,)
-                critic_loss = F.mse_loss(v, mb_target)
+                # 公式 (5)：L^VF(φ) = E[ ( V_φ(s_t) − y_t )² ]
+                v = self.critic(mb_states)                           # (m,)  V_φ(s_t)
+                critic_loss = F.mse_loss(v, mb_target)              # (V_φ(s_t) − y_t)²
                 self.critic_opt.zero_grad()
                 critic_loss.backward()
                 self.critic_opt.step()
