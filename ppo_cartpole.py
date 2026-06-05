@@ -94,7 +94,8 @@ RL Hello World 5 — PPO (PPO-Clip) on CartPole
 #         L^CLIP(θ) = E_t[ min( r_t(θ)·Â_t,
 #                               clip(r_t(θ), 1−ε, 1+ε)·Â_t ) ]
 #       Actor loss = −L^CLIP（目標要最大化 → 取負做梯度下降）
-#       → 程式：actor_loss = −min(surr1, surr2).mean()
+#       → 程式：actor_loss = −min(surr1, surr2).sum() / N
+#         （除以軌跡數 N，與 AC(TD) 對齊；epoch 1 梯度 = AC(TD) 梯度）
 #
 #   (5) Value loss（Critic 目標，MSE）
 #         L^VF(φ) = E_t[ ( V_φ(s_t) − y_t )² ]
@@ -162,6 +163,7 @@ class PPOAgent:
         next_states = torch.as_tensor(np.array(self._next_states), dtype=torch.float32)  # (T,4)
         terminateds = torch.as_tensor(np.array(self._terminateds), dtype=torch.bool)     # (T,)
         T = len(self._rewards)
+        N = int(np.sum(self._dones))   # 完整軌跡數，actor loss 除以它 → 與 AC(TD) 一致
 
         # ══════════════════════════════════════════════════════════
         #  Phase 1：更新前，用「舊策略 / 舊 critic」算好並凍結
@@ -211,7 +213,14 @@ class PPOAgent:
             #   actor_loss = −L^CLIP
             # 「被 clip 那側、ratio 飽和則不更新」的梯度遮罩，
             # 由 torch.min + torch.clamp 的次梯度自動完成（手刻版的 use_grad）。
-            actor_loss = -torch.min(surr1, surr2).mean()            # −L^CLIP(θ)
+            #
+            # ⚠️ 除以 N（軌跡數）而非 .mean()（除 T）：與 AC(TD) 的
+            #    actor_loss = -(log π·A).sum()/N 對齊。這讓「epoch 1」的
+            #    梯度精確等於 AC(TD)：ratio=1 時 min(...)=A 且 ∇(ratio·A)=∇log π·A，
+            #    normalization 也一致 → PPO 成為 AC(TD) 的乾淨超集。
+            #    （T/N = 平均 episode 長度且會隨訓練變動；用 mean 會把它藏進 lr。
+            #     註：Adam 會把整體常數縮放大半吸收，故 lr 不必大改。）
+            actor_loss = -torch.min(surr1, surr2).sum() / N         # −L^CLIP(θ)，/N 同 AC(TD)
             self.actor_opt.zero_grad()
             actor_loss.backward()
             self.actor_opt.step()
