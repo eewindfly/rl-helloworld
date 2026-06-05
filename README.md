@@ -15,6 +15,8 @@
 | 4 | `actor_critic.py` | Actor-Critic (A2C, MC) | CartPole-v1 | ✅ 完成 |
 | 4b | `actor_critic_td.py` | Actor-Critic (A2C, TD) | CartPole-v1 | ✅ 完成 |
 | 5 | `ppo_cartpole.py` | PPO (PPO-Clip) | CartPole-v1 | ✅ 完成 |
+| 5b | `ppo_pendulum.py` | PPO 連續動作 (Normal) | Pendulum-v1 | ✅ 完成（兼反例） |
+| 5c | `ppo_gae.py` | PPO + GAE | Pendulum-v1 | ⬜ 待做 |
 | 6 | `ppo_custom_env.py` | PPO | 自訂環境 | ⬜ 待做 |
 
 ---
@@ -162,6 +164,58 @@ PPO 長期是 RLHF 的標準引擎——在經典流程裡，reward model 訓練
 
 ---
 
+### ✅ 階段 5b — PPO 連續動作版 on Pendulum（兼「極簡 PPO 的天花板」反例）
+**核心概念：** 連續動作空間、高斯 policy（Normal）、單步 TD 的極限
+
+這個階段有**兩個身份**，都要讀懂：
+
+**(1) 正面教材——連續動作。** 階段 1~5 的動作全是「離散」的（CartPole 只有
+左/右，policy 用 Categorical softmax）。真實控制常是「連續」的（施多大力、
+轉幾度）。解法：policy 改輸出一個連續分布 `Normal(mean, std)`，動作從中取樣。
+
+```
+唯一改動（相比 ppo_cartpole.py，連 lr 都沒動）：
+  Actor 輸出 logits(2)        →  mean(1) + 可學習 log_std
+  Categorical(logits)         →  Normal(mean, std)
+  ratio / clip / TD δ / critic →  一行不改
+```
+
+> ★ 關鍵洞見：PPO 的 ratio = π_new/π_old 只看 log_prob，**與動作分布無關**。
+> 換成高斯，PPO 主體完全不動——連續控制（機器人、MuJoCo）用的就是這套。
+
+**(2) 反面教材——單步 TD δ 撐不起 swing-up。** Pendulum 是「把垂下的桿子甩上去」，
+馬達力矩 ≪ 重力，必須先來回擺、累積動量幾十步才會立起來。這需要「長程信用
+分配」，而階段 4b 沿用至今的「單步 TD δ」只看下一步，訊號傳不過去 → **學不起來，
+return 停在隨機水準（≈ -1400，學會應是 -150~-250）**。
+
+```
+⚠️ 這不是 bug，也不是參數沒調好（已實測）：
+   lr 掃 0.0003 / 0.001 / 0.003、加 advantage 正規化、加 reward 縮放
+   → 全都救不起來。瓶頸在「advantage 估計法」本身。
+```
+
+CartPole 能成功是因為 dense +1、單步 δ 就夠；Pendulum 不行。這個失敗**刻意**
+留著，由它親自說明下一個工具為什麼存在。
+
+---
+
+### ⬜ 階段 5c — PPO + GAE on Pendulum
+**核心概念：** GAE、λ 在 bias↔variance 間的折衷、長程信用分配
+
+階段 5b 的失敗直接引出 GAE（Generalized Advantage Estimation）：用 λ 把
+「單步 TD δ」和「多步 / Monte Carlo」加權折衷，把遙遠的成功訊號沿軌跡傳回來。
+
+```
+Â_t = Σ (γλ)^l · δ_{t+l}
+  λ=0 → 退化回單步 TD（= 階段 5b，高 bias，學不起來）
+  λ=1 → 接近 MC（高 variance）
+  λ≈0.95 → 兩者兼顧，Pendulum / 機器人控制訓得起來的關鍵
+```
+
+目標：在 Pendulum 上把 5b 學不起來的 swing-up **真的學會**，return 爬到 -250 以內。
+
+---
+
 ### ⬜ 階段 6 — PPO on 自訂環境
 **核心概念：** Gymnasium 介面、reward shaping、自己設計問題
 
@@ -183,7 +237,9 @@ PPO 長期是 RLHF 的標準引擎——在經典流程裡，reward model 訓練
     └── Actor-Critic
         ├── A2C (MC)         ← 階段 4
         ├── A2C (TD)         ← 階段 4b
-        └── PPO              ← 階段 5、6
+        └── PPO              ← 階段 5（離散）、6（自訂環境）
+            ├── 連續動作 (Normal)   ← 階段 5b（Pendulum，單步 TD 失敗的反例）
+            └── + GAE              ← 階段 5c（解決 5b 的失敗）
 ```
 
 > **關於「嚴格最小 diff」**：policy-gradient 鏈（pg → AC(MC) → AC(TD) →
@@ -193,6 +249,10 @@ PPO 長期是 RLHF 的標準引擎——在經典流程裡，reward model 訓練
 > （pg 0.01 → AC(MC) 0.0005/0.001 → AC(TD) 與 PPO 0.001/0.005）。原因是 lr
 > 與演算法本質耦合（return / advantage / TD δ 的天然尺度不同，TD 又特別吃
 > critic 準度），屬「必要的重調」而非正交超參，故保留但明示。
+>
+> 例外是**階段 5b**：它連 lr 都對齊階段 5（0.001/0.005），刻意做到「相對離散
+> 版只改了動作分布」這唯一一處——正因如此，它在 Pendulum 上的失敗才能歸因到
+> 「演算法（單步 TD δ）不夠用」，而非「參數沒調好」。
 
 ---
 
@@ -211,6 +271,8 @@ PPO 長期是 RLHF 的標準引擎——在經典流程裡，reward model 訓練
 | ε-greedy | 以 ε 機率探索，1-ε 機率利用已知最佳動作 |
 | On-policy | 用當前 policy 產生的資料來訓練（PPO） |
 | Off-policy | 可以用舊資料訓練（DQN） |
+| 連續動作 | 動作是連續實數（如力矩），policy 改輸出 `Normal(mean, std)` 取樣（階段 5b） |
+| GAE | 用 λ 折衷單步 TD 與 MC 的 advantage，把長程訊號傳回來（階段 5c） |
 
 ---
 
@@ -236,4 +298,5 @@ python pg_cartpole.py       # 階段 3  Policy Gradient
 python actor_critic.py      # 階段 4  A2C (MC)
 python actor_critic_td.py   # 階段 4b A2C (TD)
 python ppo_cartpole.py      # 階段 5  PPO
+python ppo_pendulum.py      # 階段 5b PPO 連續動作（Pendulum，刻意學不起來的反例）
 ```
