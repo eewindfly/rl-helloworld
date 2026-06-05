@@ -1,7 +1,8 @@
 """
 RL Hello World 5 — PPO (PPO-Clip) on CartPole
 ================================================
-和 actor_critic_td.py 的關係：PPO = A2C(TD) + 兩個核心改動。
+和 actor_critic_gae.py 的關係：PPO = A2C(GAE) + 兩個核心改動。
+（advantage 沿用階段 4c 的 GAE——這才是真實 PPO 的標準配置。）
 
 【一句話總結 PPO】
 
@@ -13,27 +14,31 @@ RL Hello World 5 — PPO (PPO-Clip) on CartPole
        於是同一批資料可以安全地反覆更新好幾個 epoch。
     2. 同一批 rollout 多 epoch + minibatch 複用 → 樣本效率大增。
 
-  其餘東西（GAE、entropy bonus、共享網路、advantage 正規化…）都是
+  其餘東西（entropy bonus、共享網路、advantage 正規化…）都是
   「標配但非核心」的技巧，本檔為了聚焦核心，全部不放。
-  advantage 沿用 actor_critic_td.py 的「單步 TD δ」，不用 GAE。
+  advantage 用階段 4c 的 GAE（λ=0.95）——GAE 是 advantage 估計法，
+  和 clip 完全正交，已在 4c 單獨介紹過，這裡直接沿用即可。
 
-【相比 actor_critic_td.py 的 diff（只有這些）】
+【相比 actor_critic_gae.py 的 diff（只有這些）】
 
   1. update() 開頭先用「當前 actor」算一次 old_log_prob 並凍結
      （這就是 π_old，收資料的那個策略）。
-  2. advantage 與 TD target 也在更新前用「舊 critic」算一次、凍結，
-     整個 K-epoch 過程中保持不變（PPO 標準做法）。
+  2. advantage（GAE）與 critic target（λ-return）也在更新前用「舊 critic」
+     算一次、凍結，整個 K-epoch 過程中保持不變（PPO 標準做法）。
   3. 把 A2C 的目標  log π · A
      換成 PPO 的 clipped surrogate：
         ratio      = π_new(a|s) / π_old(a|s)        ← important sampling
         L^CLIP     = min( ratio · A,  clip(ratio, 1-ε, 1+ε) · A )
   4. 外層多了「K 次 full-batch 更新」迴圈，重複用同一批資料更新。
 
+  → 換句話說：相對 4c，advantage 的算法（GAE）一字不改，新增的純粹是
+    「clip + 同批 K 次複用」。這才是 PPO 真正、唯一的概念增量。
+
 【為什麼這版「不切 minibatch」？（最小 diff 的精神）】
 
   minibatch 不是 PPO 的核心，它只是 SGD 的工程細節（省記憶體、加梯度
-  噪聲），AC(TD) 一樣能切 minibatch。把它放進「PPO vs AC」的 diff 會
-  混淆兩件正交的事。PPO 相對 AC(TD) 真正且唯一必要的概念增量只有：
+  噪聲），AC(GAE) 一樣能切 minibatch。把它放進「PPO vs AC」的 diff 會
+  混淆兩件正交的事。PPO 相對 AC(GAE) 真正且唯一必要的概念增量只有：
 
     (i)  important sampling：資料用 π_old 收，要重複拿來更新 π_new，
          就必須用 ratio = π_new/π_old 修正「採樣分布 ≠ 當前分布」的
@@ -82,13 +87,14 @@ RL Hello World 5 — PPO (PPO-Clip) on CartPole
 #                = exp( log π_θ(a_t|s_t) − log π_θ_old(a_t|s_t) )
 #       → 程式：ratio = exp(new_logp − old_logp)
 #
-#   (2) TD target（價值學習目標）
-#         y_t = r_t + γ·V(s_{t+1})        （終止時 V(s_{t+1}) = 0）
-#       → 程式：td_targets = rewards + γ * next_values
+#   (2) GAE Advantage（沿用階段 4c，λ=0.95）
+#         δ_t   = r_t + γV(s_{t+1}) − V(s_t)     （終止時 V(s_{t+1}) = 0）
+#         Â_t   = Σ_{l≥0} (γλ)^l · δ_{t+l}        （反向掃描累積，見 compute_gae）
+#       → 程式：advantages = compute_gae(deltas, dones)
 #
-#   (3) Advantage（單步 TD 殘差 δ，本檔不用 GAE）
-#         Â_t = δ_t = r_t + γV(s_{t+1}) − V(s_t) = y_t − V(s_t)
-#       → 程式：advantages = td_targets − old_values
+#   (3) Critic target（λ-return，維持 target = adv + V 的不變式）
+#         y_t = Â_t + V(s_t)
+#       → 程式：returns = advantages + values
 #
 #   (4) Clipped surrogate（PPO 的靈魂，Actor 目標）
 #         L^CLIP(θ) = E_t[ min( r_t(θ)·Â_t,
@@ -97,9 +103,9 @@ RL Hello World 5 — PPO (PPO-Clip) on CartPole
 #       → 程式：actor_loss = −min(surr1, surr2).sum() / N
 #         （除以軌跡數 N，與 AC(TD) 對齊；epoch 1 梯度 = AC(TD) 梯度）
 #
-#   (5) Value loss（Critic 目標，MSE）
+#   (5) Value loss（Critic 目標，MSE；target = λ-return y_t）
 #         L^VF(φ) = E_t[ ( V_φ(s_t) − y_t )² ]
-#       → 程式：critic_loss = mse_loss(v, td_targets)
+#       → 程式：critic_loss = mse_loss(v, returns)
 # ════════════════════════════════════════════════════════════
 
 import numpy as np
@@ -121,9 +127,10 @@ class PPOAgent:
         self.actor  = ActorNetwork()
         self.critic = CriticNetwork()
 
-        self.gamma = 0.99
-        # 對齊 AC(TD)：actor_lr=0.001、critic_lr=0.005，與其完全相同。
-        # 這樣連單步步長都一致，PPO 與 AC(TD) 的差別就純剩三項核心
+        self.gamma      = 0.99
+        self.gae_lambda = 0.95   # 沿用階段 4c 的 GAE λ，完全相同
+        # 對齊 AC(GAE)：actor_lr=0.001、critic_lr=0.005，與其完全相同。
+        # 這樣連單步步長都一致，PPO 與 AC(GAE) 的差別就純剩三項核心
         # （ratio、clip、K 次複用），沒有任何被 lr 藏起來的隱性 diff。
         self.actor_lr  = 0.001
         self.critic_lr = 0.005
@@ -157,6 +164,19 @@ class PPOAgent:
         self._terminateds.append(terminated)
         self._dones.append(done)
 
+    def compute_gae(self, deltas, dones):
+        """反向掃描把單步 δ 累積成 GAE：Â_t = δ_t + γλ·Â_{t+1}
+        （和 actor_critic_gae.py 的同名函式完全相同；done 為界重置累積）"""
+        T = len(deltas)
+        advantages = torch.zeros(T)
+        last = 0.0
+        for t in reversed(range(T)):
+            if dones[t]:
+                last = 0.0
+            last = deltas[t] + self.gamma * self.gae_lambda * last
+            advantages[t] = last
+        return advantages
+
     def update(self):
         states      = torch.as_tensor(np.array(self._states),      dtype=torch.float32)  # (T,4)
         actions     = torch.as_tensor(np.array(self._actions),     dtype=torch.long)     # (T,)
@@ -176,24 +196,23 @@ class PPOAgent:
             old_logits    = self.actor(states)                       # (T, 2)
             old_log_probs = Categorical(logits=old_logits).log_prob(actions)  # (T,)
 
-            # (b) TD target = r + γV(s')，只有真終止才把 V(s') 歸零
-            #     （truncated 照常 bootstrap —— 和 TD 版完全相同的處理）
-            #     公式 (2)：y_t = r_t + γ·V(s_{t+1})，  終止時 V(s_{t+1})=0
+            # (b) 每步 TD 殘差 δ：terminated 才把 V(s') 歸零，truncated 照常 bootstrap
+            #     δ_t = r_t + γV(s_{t+1}) − V(s_t)
+            values      = self.critic(states)                        # (T,)  V(s_t)
             next_values = self.critic(next_states)                   # (T,)  V(s_{t+1})
             next_values[terminateds] = 0.0
-            td_targets = rewards + self.gamma * next_values          # (T,)  y_t
+            deltas      = rewards + self.gamma * next_values - values  # (T,)  δ_t
 
-            # (c) advantage = TD target - V_old(s)，單步 TD δ（不用 GAE）
-            #     公式 (3)：Â_t = δ_t = y_t − V(s_t)
-            old_values = self.critic(states)                         # (T,)  V(s_t)
-            advantages = td_targets - old_values                     # (T,)  Â_t
+            # (c) advantage = GAE（公式 2，沿用 4c）；critic target = λ-return（公式 3）
+            advantages = self.compute_gae(deltas, self._dones)       # (T,)  Â_t^GAE
+            returns    = advantages + values                         # (T,)  λ-return = y_t
 
         # ══════════════════════════════════════════════════════════
         #  Phase 2：同一批資料（整批），重複做 K 次完整 update
-        #           ── 這就是「AC(TD) + IS + clip」的最小 diff：
-        #              和 AC(TD) 唯一的差別是 (1) 目標換成 clipped
+        #           ── 這就是「AC(GAE) + IS + clip」的最小 diff：
+        #              和 AC(GAE) 唯一的差別是 (1) 目標換成 clipped
         #              surrogate、(2) 同批資料更新 K 次而非 1 次。
-        #              不切 minibatch（那是正交的優化技巧）。
+        #              advantage（GAE）算法完全沿用 4c，不切 minibatch。
         # ══════════════════════════════════════════════════════════
         for _ in range(self.k_epochs):
             # ── 更新 Actor：clipped surrogate（整批）──────────
@@ -202,7 +221,7 @@ class PPOAgent:
             new_logp = Categorical(logits=logits).log_prob(actions)  # (T,)
 
             # 公式 (1)：r_t(θ) = exp( log π_θ − log π_θ_old )
-            #   AC(TD) 用的是 log π_θ 本身；PPO 改用「比值」做 important
+            #   AC(GAE) 用的是 log π_θ 本身；PPO 改用「比值」做 important
             #   sampling，才能合法地拿 π_old 收的資料反覆更新 π_new。
             ratio = torch.exp(new_logp - old_log_probs)              # r_t(θ) = π_new/π_old
             # 公式 (4) 兩項：surr1 = r_t·Â_t ，surr2 = clip(r_t,1−ε,1+ε)·Â_t
@@ -215,10 +234,10 @@ class PPOAgent:
             # 「被 clip 那側、ratio 飽和則不更新」的梯度遮罩，
             # 由 torch.min + torch.clamp 的次梯度自動完成（手刻版的 use_grad）。
             #
-            # ⚠️ 除以 N（軌跡數）而非 .mean()（除 T）：與 AC(TD) 的
+            # ⚠️ 除以 N（軌跡數）而非 .mean()（除 T）：與 AC(GAE) 的
             #    actor_loss = -(log π·A).sum()/N 對齊。這讓「epoch 1」的
-            #    梯度精確等於 AC(TD)：ratio=1 時 min(...)=A 且 ∇(ratio·A)=∇log π·A，
-            #    normalization 也一致 → PPO 成為 AC(TD) 的乾淨超集。
+            #    梯度精確等於 AC(GAE)：ratio=1 時 min(...)=A 且 ∇(ratio·A)=∇log π·A，
+            #    normalization 也一致 → PPO 成為 AC(GAE) 的乾淨超集。
             #    （T/N = 平均 episode 長度且會隨訓練變動；用 mean 會把它藏進 lr。
             #     註：Adam 會把整體常數縮放大半吸收，故 lr 不必大改。）
             actor_loss = -torch.min(surr1, surr2).sum() / N         # −L^CLIP(θ)，/N 同 AC(TD)
@@ -226,10 +245,10 @@ class PPOAgent:
             actor_loss.backward()
             self.actor_opt.step()
 
-            # ── 更新 Critic：value MSE（target 已凍結，整批）──
+            # ── 更新 Critic：value MSE（target = λ-return，已凍結，整批）──
             # 公式 (5)：L^VF(φ) = E[ ( V_φ(s_t) − y_t )² ]
             v = self.critic(states)                                  # (T,)  V_φ(s_t)
-            critic_loss = F.mse_loss(v, td_targets)                 # (V_φ(s_t) − y_t)²
+            critic_loss = F.mse_loss(v, returns)                    # (V_φ(s_t) − y_t)²
             self.critic_opt.zero_grad()
             critic_loss.backward()
             self.critic_opt.step()
@@ -251,10 +270,10 @@ def train():
     env   = gym.make("CartPole-v1")
     agent = PPOAgent()
 
-    # ⚠️ 對齊 AC(TD)：batch=4、共 250 次更新、總計 1000 episodes，完全相同。
+    # ⚠️ 對齊 AC(GAE)：batch=4、共 250 次更新、總計 1000 episodes，完全相同。
     #    batch 大小是正交超參（AC 也能調大），非 PPO 核心，故對齊以保持最小 diff。
     #    （PPO 實務上偏好更大的 batch 讓 IS 重複利用更穩，那是「標配但非核心」，
-    #      和 GAE/entropy 同一類，本檔一律不加。clip 已能讓小 batch 安全複用。）
+    #      和 entropy bonus 同一類，本檔一律不加。clip 已能讓小 batch 安全複用。）
     BATCH_EPISODES = 4     # 每收集 4 條軌跡才更新一次（batch size，與 AC(TD) 相同）
     NUM_UPDATES    = 250   # 總共要更新幾次（與 AC(TD) 相同，總環境互動量一致）
     EPISODES       = BATCH_EPISODES * NUM_UPDATES
@@ -266,7 +285,7 @@ def train():
     print(f"\nclip ε = {agent.clip_eps}   K_epochs = {agent.k_epochs}   "
           f"(full-batch，不切 minibatch)")
     print("核心   ：ratio(important sampling) + clip + 同批 K 次複用")
-    print("advantage：單步 TD δ（沿用 A2C-TD，不用 GAE）")
+    print(f"advantage：GAE λ={agent.gae_lambda}（沿用階段 4c，真 PPO 的標配）")
     print("目標   ：近 50 回合平均分 ≥ 195 = 解決！")
     print(f"\n開始訓練 {EPISODES} 個 episodes...\n")
 
@@ -321,21 +340,22 @@ def train():
 
     # ── 對比總結：A2C(TD) vs PPO ──
     print("\n" + "=" * 60)
-    print("  A2C(TD) vs PPO")
+    print("  A2C(GAE) vs PPO")
     print("=" * 60)
     rows = [
         ("Actor 目標",   "log π · A",                 "min(ratio·A, clip(ratio)·A)"),
         ("資料複用",      "用一次就丟",                 "同批 K epoch 反覆用"),
         ("更新幅度控制",  "靠調 lr",                    "靠 clip 夾住 ratio"),
-        ("advantage",    "單步 TD δ",                  "單步 TD δ（相同）"),
+        ("advantage",    "GAE (λ=0.95)",              "GAE (λ=0.95，相同)"),
         ("樣本效率",      "低",                         "高"),
     ]
-    print(f"  {'':14s} {'A2C(TD)':28s} {'PPO':30s}")
+    print(f"  {'':14s} {'A2C(GAE)':28s} {'PPO':30s}")
     print("  " + "-" * 74)
     for label, a, p in rows:
         print(f"  {label:14s} {a:28s} {p:30s}")
     print("\n核心洞見：")
-    print("  PPO = A2C + 「ratio + clip」+「同批多 epoch 複用」")
+    print("  PPO = A2C(GAE) + 「ratio + clip」+「同批多 epoch 複用」")
+    print("  advantage 用 GAE（4c 那塊拼圖）——這才是真實 PPO 的標準配置。")
     print("  RLHF（ChatGPT 的訓練方式）用的就是 PPO。")
 
     return agent
