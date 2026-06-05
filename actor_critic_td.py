@@ -1,7 +1,11 @@
 """
 RL Hello World 4b — Actor-Critic (A2C) TD 版 on CartPole
 =========================================================
-和 actor_critic.py 的唯一差異：把 MC return 換成 TD target。
+和 actor_critic.py 的唯一「概念」差異：把 MC return 換成 TD target。
+（⚠️ 另有一處非概念差異：lr 也重調了，actor 0.0005→0.001、critic
+  0.001→0.005，見下方 __init__ 註解。lr 是整個 pg→AC→PPO 系列唯一
+  沒被固定的對照變數——batch / 更新次數 / 正規化 /N / gamma / 網路都對齊，
+  唯獨 lr 因與演算法尺度耦合而每階段重調，屬必要重調而非正交超參。）
 
 【MC 版 vs TD 版的核心差異】
 

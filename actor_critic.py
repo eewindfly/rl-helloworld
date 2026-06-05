@@ -42,6 +42,11 @@ RL Hello World 4 — Actor-Critic (A2C) on CartPole
 
   其餘結構（訓練迴圈、反向傳播邏輯）和 pg_cartpole.py 完全相同。
 
+  ⚠️ 嚴格說還有一處沒被隔離：lr 也重調了（pg 0.01 → 本檔 actor 0.0005、
+     critic 0.001）。lr 與演算法尺度耦合（advantage 比 raw return 小），
+     屬必要重調而非正交超參——batch / 更新次數 / 正規化 /N / gamma /
+     網路都對齊了，唯獨 lr 是整個系列唯一沒固定住的對照變數。
+
 【MC vs TD：兩種估計 Q 的方式】
 
   Advantage = Q(s,a) - V(s)，Q 不直接 train，用估計替代：

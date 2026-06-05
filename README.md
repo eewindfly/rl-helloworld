@@ -127,18 +127,25 @@ PPO Objective：
   → 比值偏離 1 太多就截斷，保守更新
 ```
 
-**本檔定位（教科書核心版）：**
-只放 PPO 真正的核心——`ratio + clip`（ε=0.2）與「同批 K epoch ×
-minibatch 複用」；advantage 沿用階段 4b 的單步 TD δ。
-刻意**不放** GAE、entropy bonus、共享網路、advantage 正規化等
-「標配但非核心」的技巧，讓 diff 精準隔離出「PPO = A2C + clip」。
+**本檔定位（教科書核心版，嚴格最小 diff）：**
+只放 PPO 真正的核心——`ratio + clip`（ε=0.2）與「同批整批複用 K 次」；
+advantage 沿用階段 4b 的單步 TD δ。刻意**不放** GAE、entropy bonus、
+共享網路、advantage 正規化，**也不切 minibatch**（minibatch 是正交的
+SGD 工程技巧，AC 一樣能用，非 PPO 核心），讓 diff 精準隔離出
+「PPO = A2C(TD) + clip」。為求乾淨對照，batch（4）、更新次數（250）、
+actor 正規化（`.sum()/N`）、lr（actor 0.001 / critic 0.005）全部對齊
+階段 4b。
 
 ```
-相比 actor_critic_td.py 的唯一改動：
+相比 actor_critic_td.py 的唯一改動（只有這三點）：
   1. 更新前凍結 old_log_prob（π_old）與 advantage / TD target
-  2. 目標  log π · A  →  min(ratio·A, clip(ratio)·A)
-  3. 外層加「K epoch × minibatch」迴圈，重複用同一批資料
+  2. 目標  log π · A  →  min(ratio·A, clip(ratio)·A)，ratio 做 important sampling
+  3. 外層加「整批複用 K 次」迴圈，重複用同一批資料（不切 minibatch）
 ```
+
+> 細節：用 `/N`（軌跡數）正規化而非 `.mean()`，與整個系列一致——這讓
+> PPO「第一個 epoch」的梯度精確等於 AC(TD)（ratio=1 時 ∇(ratio·A)=∇log π·A），
+> PPO 因此是 AC(TD) 不打折的乾淨超集。
 
 **為什麼以 PPO 收尾：**
 PPO 長期是 RLHF 的標準引擎——在經典流程裡，reward model 訓練完之後，
@@ -178,6 +185,14 @@ PPO 長期是 RLHF 的標準引擎——在經典流程裡，reward model 訓練
         ├── A2C (TD)         ← 階段 4b
         └── PPO              ← 階段 5、6
 ```
+
+> **關於「嚴格最小 diff」**：policy-gradient 鏈（pg → AC(MC) → AC(TD) →
+> PPO）刻意把 batch（4）、更新次數（250）、總 episodes（1000）、actor 正規化
+> （`.sum()/N`）、gamma（0.99）、網路架構全部對齊，好讓階段間的 diff 只剩
+> 「核心概念」。**唯一沒被隔離的變數是 learning rate**：每階段各自重調
+> （pg 0.01 → AC(MC) 0.0005/0.001 → AC(TD) 與 PPO 0.001/0.005）。原因是 lr
+> 與演算法本質耦合（return / advantage / TD δ 的天然尺度不同，TD 又特別吃
+> critic 準度），屬「必要的重調」而非正交超參，故保留但明示。
 
 ---
 

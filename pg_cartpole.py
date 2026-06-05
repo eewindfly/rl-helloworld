@@ -128,6 +128,13 @@ class PGAgent:
         # 超參數
         self.gamma = 0.99   # 折扣因子
         self.lr    = 0.01   # 學習率
+        # ⚠️ 對照說明：整個系列（pg → AC(MC) → AC(TD) → PPO）刻意把
+        #    batch=4、更新=250、總計 1000 episodes、actor 正規化 /N、
+        #    gamma、網路架構全部對齊，好讓階段間的 diff 只剩「核心概念」。
+        #    唯一未對齊的變數就是 lr：每階段各自重調（本檔 0.01）。
+        #    原因是 lr 與演算法本質耦合（return / advantage / TD δ 的天然
+        #    尺度不同，TD 又特別吃 critic 準度），屬於「必要的重調」而非
+        #    正交超參，故保留但在此明示——它是唯一沒被隔離的對照變數。
 
         # PyTorch 用 optimizer 取代手刻的 W -= lr * grad。
         # Adam 是 RL 的事實標準（Spinning Up / CleanRL 全用它）：
