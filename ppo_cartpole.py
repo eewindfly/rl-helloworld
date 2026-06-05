@@ -122,9 +122,10 @@ class PPOAgent:
         self.critic = CriticNetwork()
 
         self.gamma = 0.99
-        # PPO 一次收一批資料要反覆更新 K_EPOCHS 次，等於同一批資料
-        # 被「重用 K 次」，所以單次 lr 要比 A2C(TD) 小一點，否則累積更新過頭。
-        self.actor_lr  = 0.0015
+        # 對齊 AC(TD)：actor_lr=0.001、critic_lr=0.005，與其完全相同。
+        # 這樣連單步步長都一致，PPO 與 AC(TD) 的差別就純剩三項核心
+        # （ratio、clip、K 次複用），沒有任何被 lr 藏起來的隱性 diff。
+        self.actor_lr  = 0.001
         self.critic_lr = 0.005
 
         self.actor_opt  = torch.optim.Adam(self.actor.parameters(),  lr=self.actor_lr)
