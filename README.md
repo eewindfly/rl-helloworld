@@ -17,7 +17,8 @@
 | 4c | `actor_critic_gae.py` | Actor-Critic (A2C, GAE) | CartPole-v1 | ✅ 完成 |
 | 5 | `ppo_cartpole.py` | PPO (PPO-Clip + GAE) | CartPole-v1 | ✅ 完成 |
 | 5b | `ppo_pendulum.py` | PPO 連續動作 (Normal + GAE) | Pendulum-v1 | ✅ 完成 |
-| 6 | `ppo_custom_env.py` | PPO | 自訂環境 | ⬜ 待做 |
+| 6a | `ppo_custom_env_schedule.py` | PPO 離散（沿用 5） | 自訂排程環境 | ✅ 完成 |
+| 6b | `ppo_custom_env_trading.py` | PPO 連續（沿用 5b） | 自訂交易環境 | ✅ 完成 |
 
 ---
 
@@ -238,11 +239,62 @@ PPO 長期是 RLHF 的標準引擎——在經典流程裡，reward model 訓練
 
 ---
 
-### ⬜ 階段 6 — PPO on 自訂環境
+### ✅ 階段 6 — PPO on 自訂環境
 **核心概念：** Gymnasium 介面、reward shaping、自己設計問題
 
-用 `gymnasium` 包一個自己的問題（例如：簡單交易環境、迷宮、排程問題）。
-把前面學的 PPO 套上去，體驗「定義問題」比「改演算法」更重要。
+前面 1~5b 的主角都是「演算法」，環境（CartPole / Pendulum）是別人寫好的。
+真實工作裡剛好相反：**演算法直接拿現成的 PPO，難的是把你的問題包成一個
+Gymnasium 環境**——定義 state / action / reward，尤其是 reward shaping。
+這一階段親手體驗：「定義問題」比「改演算法」更需要動腦。做了兩個自訂環境，
+一個離散、一個連續，各複用前面一條 PPO。
+
+#### ✅ 階段 6a — 多機台排程（離散，沿用階段 5 的 PPO）
+
+一條條進來的 job 各有大小，即時決定丟到 M 台機器哪一台，目標讓 makespan
+（最忙那台的總負載）最小——也就是負載平衡。
+
+```
+state ：[當前 job 大小, 各機台負載(去均值), 進度比例]   → M+2 維
+action：丟到哪一台（離散 M 選 1）
+reward：-(這步造成的 makespan 增量)
+```
+
+**reward shaping 的關鍵（本檔最該看的地方）：**
+每步給「makespan 增量」的負值，整條 episode 加起來會望遠鏡式抵銷成
+`−最終 makespan`——和「只在最後給 −makespan」等價，但**每步都有訊號**
+（dense reward），PPO 學得快、critic 好估。沒人教它「挑最閒的丟」，它從
+這個 reward 自己學出負載平衡，訓練後 makespan 逼近貪婪(最閒優先)啟發式。
+
+```
+與階段 5 的 diff：PPO 演算法（ratio+clip+GAE+K 次複用）一行不改，
+  只 (1) 換環境，(2) 因 obs=5/act=3 而調 Actor/Critic 的「輸入輸出維度」
+  （只動網路 in/out 尺寸，演算法邏輯沒碰）。
+```
+
+#### ✅ 階段 6b — 均值回歸交易（連續，沿用階段 5b 的 PPO）
+
+對一個均值回歸（OU 過程）的價格做多空：價格被拉回均值，偏高該放空、偏低該
+做多。動作是「持有多少部位」——連續的，所以用 5b 的高斯 policy。
+
+```
+state ：[價格(去均值), 上一步價格變動, 目前部位]  → 3 維（與 Pendulum 相同）
+action：目標部位 q ∈ [-1,1]                   → 1 維連續
+reward：pnl − 交易成本 = q·(下一步價格變動) − c·|換手|
+```
+
+**★ 連網路維度都不用換：** obs 剛好 3 維、action 1 維，與 Pendulum 介面完全
+相同，於是**直接 import 階段 5b 的 `PPOAgent`，整個 agent 一行不改**，只傳進
+動作邊界 [-1,1]。這份檔案新增的「只有環境」——把階段 6 的精神釘到最死。
+沒人教它「價高放空」，它從「pnl − 成本」自己學出均值回歸交易，學到的
+「價格→部位」反應函數呈負斜率，return 從 ≈0 逼近先知規則。
+
+> **兩種複用對照：** 6a 還要換一下網路維度；6b 連這都省了。一起說明：
+> 真實世界用 PPO，動作離散就接離散版、連續就接連續版，**演算法是現成的，
+> 你出力的地方永遠是「定義問題」**。
+
+> ⚠️ 6b 是教學用的合成價格（OU 均值回歸），不是真實市場；真實價格遠更接近
+> 隨機漫步、訊號弱得多。這裡的重點是「如何把問題包成環境 + reward shaping」，
+> 不是可獲利的交易策略。
 
 ---
 
@@ -263,7 +315,9 @@ PPO 長期是 RLHF 的標準引擎——在經典流程裡，reward model 訓練
         └── PPO = A2C(GAE) + clip
             ├── 離散 (CartPole)      ← 階段 5
             ├── 連續動作 (Normal)    ← 階段 5b（Pendulum，GAE 讓 swing-up 學得起來）
-            └── 自訂環境             ← 階段 6
+            └── 自訂環境             ← 階段 6（演算法現成，重點在定義問題）
+                ├── 離散：排程       ← 階段 6a（沿用 5，只換網路維度）
+                └── 連續：交易       ← 階段 6b（沿用 5b，agent 一行不改）
 ```
 
 > **關於「嚴格最小 diff」**：policy-gradient 鏈（pg → AC(MC) → AC(TD) →
@@ -300,6 +354,8 @@ PPO 長期是 RLHF 的標準引擎——在經典流程裡，reward model 訓練
 | GAE | 用 λ 把單步 TD（λ=0）與 MC（λ=1）的 advantage 連成光譜，把長程訊號傳回來（階段 4c） |
 | λ-return | GAE 對應的 critic target：Â + V(s)，即 TD(λ) 的目標（階段 4c） |
 | 連續動作 | 動作是連續實數（如力矩），policy 改輸出 `Normal(mean, std)` 取樣（階段 5b） |
+| Gymnasium 介面 | 把問題包成 `reset` / `step` / `observation_space` / `action_space` 的標準環境（階段 6） |
+| Reward shaping | 在不改最終目標下，把稀疏終局獎勵拆成密集逐步獎勵，讓 agent 學得快（階段 6a） |
 
 ---
 
@@ -327,4 +383,6 @@ python actor_critic_td.py   # 階段 4b A2C (TD)
 python actor_critic_gae.py  # 階段 4c A2C (GAE)
 python ppo_cartpole.py      # 階段 5  PPO (+ GAE)
 python ppo_pendulum.py      # 階段 5b PPO 連續動作（Pendulum，GAE 讓 swing-up 學得起來）
+python ppo_custom_env_schedule.py  # 階段 6a 自訂排程環境（離散，沿用階段 5）
+python ppo_custom_env_trading.py   # 階段 6b 自訂交易環境（連續，沿用階段 5b）
 ```
