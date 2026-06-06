@@ -16,7 +16,9 @@ RL Hello World 4c — Actor-Critic (A2C) GAE 版 on CartPole
             = δ_t + γλ·δ_{t+1} + (γλ)²·δ_{t+2} + ...
 
     λ = 0  →  Â_t = δ_t               （退化成階段 4b 的單步 TD）
-    λ = 1  →  Â_t = Σ γ^l r − V(s_t)  （退化成階段 4 的 MC，無 bias）
+    λ = 1  →  Â_t = G_t − V(s_t)       （退化成階段 4 的 MC，無 bias；
+                                         嚴格寫 G_t = Σ γ^l r + γ^n V(s_{t+n})，
+                                         真終止時 V=0 才簡化成 Σ γ^l r − V）
     λ ≈ 0.95（本檔）→ 兩者折衷：保留多步訊號、又不像 MC 那麼吵
 
   直覺：δ_t 只看下一步；GAE 把「後面好幾步的 δ」用 (γλ)^l 衰減後加總，
@@ -27,9 +29,10 @@ RL Hello World 4c — Actor-Critic (A2C) GAE 版 on CartPole
 
   本系列從頭到尾有個不變式：critic target = advantage + V(s)。
     階段 4  MC：target = (G_t − V) + V = G_t
-    階段 4b TD：target = (δ   − 0) ... 即 r+γV(s')  （= advantage + V）
+    階段 4b TD：advantage = δ，target = δ + V = r + γV(s')
   GAE 也照辦：
-    target = Â_t^GAE + V(s_t)   ← 這東西就叫「λ-return」，是 TD(λ) 的目標。
+    target = Â_t^GAE + V(s_t)   ← 這東西就叫「λ-return」
+                                  （GAE 的 backward view；加回 V 即 TD(λ) 的 forward view 目標）
   所以「換成 GAE」這一個動作，同時決定了 advantage 與 critic target，
   和階段 4 / 4b 的模式一模一樣——依然是「只改一個東西：advantage 的估法」。
 
