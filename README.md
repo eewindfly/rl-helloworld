@@ -9,7 +9,7 @@
 
 | # | 檔案 | 演算法 | 環境 | 狀態 |
 |---|------|--------|------|------|
-| 1 | `rl_helloworld.py` | Q-Learning | GridWorld (4×4) | ✅ 完成 |
+| 1 | `q_learning_gridworld.py` | Q-Learning | GridWorld (4×4) | ✅ 完成 |
 | 2 | `dqn_cartpole.py` | DQN | CartPole-v1 | ✅ 完成 |
 | 3 | `pg_cartpole.py` | Policy Gradient (REINFORCE) | CartPole-v1 | ✅ 完成 |
 | 4 | `actor_critic.py` | Actor-Critic (A2C, MC) | CartPole-v1 | ✅ 完成 |
@@ -375,7 +375,7 @@ pip install -r requirements.txt
 執行範例：
 
 ```bash
-python rl_helloworld.py     # 階段 1  Q-Learning
+python q_learning_gridworld.py     # 階段 1  Q-Learning
 python dqn_cartpole.py      # 階段 2  DQN
 python pg_cartpole.py       # 階段 3  Policy Gradient
 python actor_critic.py      # 階段 4  A2C (MC)
